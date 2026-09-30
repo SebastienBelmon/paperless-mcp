@@ -623,6 +623,52 @@ describe("select custom field value resolution in document handlers", () => {
   });
 });
 
+describe("get_document_content offset and max_length", () => {
+  const api = {
+    getDocument: async (id: number) => ({
+      id,
+      title: "Manual",
+      content: "0123456789",
+    }),
+  } as unknown as PaperlessAPI;
+
+  async function readContent(args: Record<string, unknown>) {
+    let result: CallToolResult | undefined;
+    await withDocumentClient(api, async (client) => {
+      result = (await client.callTool({
+        name: "get_document_content",
+        arguments: { id: 1, ...args },
+      })) as CallToolResult;
+    });
+    assert.ok(result && !result.isError, "get_document_content failed");
+    return parseToolText(result);
+  }
+
+  test("without offset or max_length the response is unchanged", async () => {
+    assert.deepEqual(await readContent({}), {
+      id: 1,
+      title: "Manual",
+      content: "0123456789",
+    });
+  });
+
+  test("returns the requested slice and the offset of the next one", async () => {
+    assert.deepEqual(await readContent({ offset: 2, max_length: 3 }), {
+      id: 1,
+      title: "Manual",
+      content: "234",
+      total_length: 10,
+      next_offset: 5,
+    });
+  });
+
+  test("next_offset is null on the last slice", async () => {
+    const result = await readContent({ offset: 8, max_length: 5 });
+    assert.equal(result.content, "89");
+    assert.equal(result.next_offset, null);
+  });
+});
+
 describe("document resource reference tools", () => {
   // Expected URIs come from the builders rather than literals: their exact
   // format is already pinned by utils/resourceUri.test.ts, and what matters

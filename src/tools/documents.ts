@@ -464,13 +464,44 @@ export function registerDocumentTools(server: McpServer, api: PaperlessAPI) {
 
   server.tool(
     "get_document_content",
-    "Get the text content of a specific document by ID. Use this when you need to read or analyze the actual document text.",
+    "Get the text content of a specific document by ID. Use this when you need to read or analyze the actual document text. For long documents, always pass max_length (e.g. 20000) and follow next_offset until it is null. With offset or max_length, the response also includes total_length and next_offset (the offset for the next call, or null at the end of the text).",
     {
       id: z.number(),
+      offset: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .describe("Character position to start reading from (default 0)"),
+      max_length: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe("Maximum number of characters to return"),
     },
     withErrorHandling(async (args, extra) => {
       if (!api) throw new Error("Please configure API connection first");
       const doc = await api.getDocument(args.id);
+      if (args.offset !== undefined || args.max_length !== undefined) {
+        const text = doc.content ?? "";
+        const offset = args.offset ?? 0;
+        const end = Math.min(offset + (args.max_length ?? text.length), text.length);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                id: doc.id,
+                title: doc.title,
+                content: text.slice(offset, end),
+                total_length: text.length,
+                next_offset: end < text.length ? end : null,
+              }),
+            },
+          ],
+        };
+      }
       return {
         content: [
           {
