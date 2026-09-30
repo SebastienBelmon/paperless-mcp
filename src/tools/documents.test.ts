@@ -316,6 +316,44 @@ test("rejects duplicate first-class and paperless_filters definitions", () => {
   );
 });
 
+test("rejects fields passed both as an argument and in paperless_filters", () => {
+  assert.throws(
+    () =>
+      buildDocumentQueryString({
+        fields: ["id"],
+        paperless_filters: {
+          fields: ["title"],
+        },
+      }),
+    /Duplicate filter 'fields'/
+  );
+});
+
+describe("fields argument on document list tools", () => {
+  for (const tool of ["list_documents", "query_documents"]) {
+    test(`${tool} forwards fields to Paperless as a comma-separated list`, async () => {
+      const queries: string[] = [];
+      const api = {
+        getDocuments: async (query: string) => {
+          queries.push(query);
+          return { count: 0, next: null, previous: null, all: [], results: [] };
+        },
+      } as unknown as PaperlessAPI;
+
+      await withDocumentClient(api, async (client) => {
+        const result = (await client.callTool({
+          name: tool,
+          arguments: { fields: ["id", "title"] },
+        })) as CallToolResult;
+        assert.ok(!result.isError, `${tool} failed`);
+      });
+
+      assert.equal(queries.length, 1);
+      assert.equal(getQueryParams(queries[0]).get("fields"), "id,title");
+    });
+  }
+});
+
 test("rejects invalid custom_field_query shapes", () => {
   assert.equal(customFieldQuerySchema.safeParse(["field", "exact"]).success, false);
   assert.equal(customFieldQuerySchema.safeParse(["AND", []]).success, false);

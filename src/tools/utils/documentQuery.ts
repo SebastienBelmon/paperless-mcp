@@ -124,6 +124,13 @@ const DOCUMENT_QUERY_BASE_ARGS_SHAPE = {
   archive_serial_number: z.number().optional(),
   archive_serial_number__isnull: z.boolean().optional(),
   custom_fields__icontains: z.string().min(1).optional(),
+  fields: z
+    .array(z.string())
+    .min(1)
+    .optional()
+    .describe(
+      'Return only these document fields, e.g. ["id","title","correspondent","document_type","tags","created"]. Omit to return every field.'
+    ),
 };
 
 export const LIST_DOCUMENTS_ARGS_SHAPE = {
@@ -170,6 +177,7 @@ export type BuildDocumentQueryArgs = {
   archive_serial_number__isnull?: boolean;
   custom_field_query?: string | CustomFieldQuery;
   custom_fields__icontains?: string;
+  fields?: string[];
   paperless_filters?: Record<string, PaperlessFilterValue>;
 };
 
@@ -189,6 +197,7 @@ const FIRST_CLASS_QUERY_PARAM_MAP = {
   archive_serial_number: "archive_serial_number",
   archive_serial_number__isnull: "archive_serial_number__isnull",
   custom_fields__icontains: "custom_fields__icontains",
+  fields: "fields",
 } as const;
 
 type FirstClassQueryArg = keyof typeof FIRST_CLASS_QUERY_PARAM_MAP;
@@ -347,7 +356,7 @@ export function buildDocumentQueryString(args: BuildDocumentQueryArgs): string {
       continue;
     }
 
-    setQueryParam(query, queryParamName, value as string | number | boolean);
+    setQueryParam(query, queryParamName, value);
     firstClassKeys.add(queryParamName);
   }
 
