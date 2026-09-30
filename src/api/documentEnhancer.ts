@@ -105,21 +105,21 @@ async function enhanceDocumentsArray(
     })
     .map((doc) => ({
       ...doc,
-      correspondent: doc.correspondent
+      correspondent: doc.correspondent != null
         ? {
             id: doc.correspondent,
             name:
               correspondentMap.get(doc.correspondent) ||
               String(doc.correspondent),
           }
-        : null,
-      document_type: doc.document_type
+        : doc.correspondent,
+      document_type: doc.document_type != null
         ? {
             id: doc.document_type,
             name:
               documentTypeMap.get(doc.document_type) || String(doc.document_type),
           }
-        : null,
+        : doc.document_type,
       tags: Array.isArray(doc.tags)
         ? doc.tags.map((tagId) => ({
             id: tagId,

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { CallToolResult } from "@modelcontextprotocol/sdk/types";
 import { convertDocsWithNames } from "./documentEnhancer";
-import { DocumentsResponse } from "./types";
+import { Document, DocumentsResponse } from "./types";
 import { createDocument, createPaperlessApiMock } from "../test/mocks/paperlessApi";
 
 const LARGE_DOCUMENT_COUNT = 709;
@@ -31,6 +31,25 @@ test("convertDocsWithNames omits `all` and keeps paginated JSON shape", async ()
   assert.ok(!("all" in parsed));
   assert.deepEqual(parsed.results.map((doc: { id: number }) => doc.id), [1, 2]);
   assert.ok(!("content" in parsed.results[0]));
+});
+
+test("convertDocsWithNames does not add correspondent or document_type when the response omits them", async () => {
+  const { correspondent, document_type, ...partial } = createDocument();
+  const docsResponse: DocumentsResponse = {
+    count: 2,
+    next: null,
+    previous: null,
+    all: [1, 2],
+    results: [partial as Document, createDocument({ id: 2 })],
+  };
+
+  const result = await convertDocsWithNames(docsResponse, createPaperlessApiMock());
+  const [omitted, unset] = JSON.parse(getTextContent(result)).results;
+
+  assert.ok(!("correspondent" in omitted));
+  assert.ok(!("document_type" in omitted));
+  assert.equal(unset.correspondent, null);
+  assert.equal(unset.document_type, null);
 });
 
 test("convertDocsWithNames keeps responses small when source has large `all` arrays", async () => {
