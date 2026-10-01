@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
+import { createHash, randomBytes } from "node:crypto";
 import {
+  existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   realpathSync,
@@ -8,9 +11,17 @@ import {
   truncateSync,
   writeFileSync,
 } from "node:fs";
+import {
+  createServer,
+  IncomingHttpHeaders,
+  IncomingMessage,
+  ServerResponse,
+} from "node:http";
+import { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { after, before, describe, test } from "node:test";
+import { Readable } from "node:stream";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport";
@@ -60,21 +71,49 @@ function getDocumentQueryParamsFromOpenApi() {
 
 // ALLOWED_UPLOAD_PATHS is read from the environment at module load, so the
 // allowlist can only be exercised by re-importing the module with the env set.
-function validateFilePathWithAllowlist(
+function loadDocumentsWithAllowlist(
   allowedPaths: string
-): typeof validateFilePath {
+): typeof import("./documents") {
   const modulePath = require.resolve("./documents");
   const previous = process.env.PAPERLESS_MCP_UPLOAD_PATHS;
   process.env.PAPERLESS_MCP_UPLOAD_PATHS = allowedPaths;
   delete require.cache[modulePath];
   try {
-    return require("./documents").validateFilePath;
+    return require("./documents");
   } finally {
     delete require.cache[modulePath];
     if (previous === undefined) {
       delete process.env.PAPERLESS_MCP_UPLOAD_PATHS;
     } else {
       process.env.PAPERLESS_MCP_UPLOAD_PATHS = previous;
+    }
+  }
+}
+
+function validateFilePathWithAllowlist(
+  allowedPaths: string
+): typeof validateFilePath {
+  return loadDocumentsWithAllowlist(allowedPaths).validateFilePath;
+}
+
+async function withEnv<T>(
+  name: string,
+  value: string | undefined,
+  run: () => Promise<T>
+): Promise<T> {
+  const previous = process.env[name];
+  if (value === undefined) {
+    delete process.env[name];
+  } else {
+    process.env[name] = value;
+  }
+  try {
+    return await run();
+  } finally {
+    if (previous === undefined) {
+      delete process.env[name];
+    } else {
+      process.env[name] = previous;
     }
   }
 }
@@ -303,6 +342,51 @@ test("rejects unsupported paperless_filters keys", () => {
   );
 });
 
+test("explains that unknown paperless_filters keys would be silently ignored", () => {
+  assert.throws(
+    () =>
+      buildDocumentQueryString({ paperless_filters: { not_a_real_filter: 1 } }),
+    /Unsupported paperless_filters key 'not_a_real_filter'.*silently ignores unknown filters.*return all documents/
+  );
+});
+
+for (const key of ["id__gt", "id__gte", "id__lt", "id__lte"]) {
+  test(`${key} is rejected with a hint about the available alternatives`, () => {
+    assert.throws(
+      () => buildDocumentQueryString({ paperless_filters: { [key]: 100 } }),
+      (error: Error) => {
+        assert.ok(error.message.startsWith(`Unsupported paperless_filters key '${key}'`));
+        assert.match(error.message, /no id range filter/);
+        assert.match(error.message, /ordering '-id' with page_size/);
+        assert.match(error.message, /added__date__gt/);
+        assert.match(error.message, /added__date__gte/);
+        assert.match(error.message, /id__in/);
+        return true;
+      }
+    );
+  });
+}
+
+test("accepts the documented filters that replace an id range", () => {
+  const query = getQueryParams(
+    buildDocumentQueryString({
+      paperless_filters: {
+        added__date__gt: "2026-01-01",
+        added__date__gte: "2026-01-02",
+        checksum__iexact: "ABC123",
+        owner__id: 4,
+        id__in: [7, 8],
+      },
+    })
+  );
+
+  assert.equal(query.get("added__date__gt"), "2026-01-01");
+  assert.equal(query.get("added__date__gte"), "2026-01-02");
+  assert.equal(query.get("checksum__iexact"), "ABC123");
+  assert.equal(query.get("owner__id"), "4");
+  assert.equal(query.get("id__in"), "7,8");
+});
+
 test("rejects duplicate first-class and paperless_filters definitions", () => {
   assert.throws(
     () =>
@@ -402,10 +486,11 @@ describe("validateFilePath", () => {
   });
 
   test("rejects non-existent files", async () => {
-    await assert.rejects(
-      () => validateFilePath(join(testDir, "missing.pdf")),
-      { message: "File not found" }
-    );
+    const missing = join(testDir, "missing.pdf");
+    await assert.rejects(() => validateFilePath(missing), (error: Error) => {
+      assert.ok(error.message.startsWith(`File not found: ${missing} `));
+      return true;
+    });
   });
 
   test("rejects directories", async () => {
@@ -437,6 +522,60 @@ describe("validateFilePath", () => {
     });
   });
 
+  test("returns the resolved real path, following symlinks", async () => {
+    assert.equal(await validateFilePath(testFile), realpathSync(testFile));
+    if (!existsSync(symlinkPath)) return;
+    assert.equal(await validateFilePath(symlinkPath), realpathSync(testFile));
+  });
+
+  test("finds a file whose accents are normalized differently from the disk", async () => {
+    const dir = join(testDir, "Manuels é");
+    mkdirSync(dir.normalize("NFD"));
+    const onDisk = join(dir.normalize("NFD"), "Sché.pdf".normalize("NFD"));
+    writeFileSync(onDisk, "%PDF-1.4\naccents");
+
+    const resolved = await validateFilePath(join(dir, "Sché.pdf").normalize("NFC"));
+    assert.equal(resolved, realpathSync(onDisk));
+  });
+
+  test("rejects a file over a lowered PAPERLESS_MCP_MAX_UPLOAD_MB", async () => {
+    const file = join(testDir, "two-mb.pdf");
+    writeFileSync(file, Buffer.alloc(2 * 1024 * 1024, 1));
+
+    await withEnv("PAPERLESS_MCP_MAX_UPLOAD_MB", "1", async () => {
+      await assert.rejects(() => validateFilePath(file), {
+        message:
+          "File size (2MB) exceeds maximum allowed size (1MB). Set PAPERLESS_MCP_MAX_UPLOAD_MB to change the limit (0 = unlimited).",
+      });
+    });
+  });
+
+  test("PAPERLESS_MCP_MAX_UPLOAD_MB=0 and larger values accept files over 100MB", async () => {
+    const file = join(testDir, "huge.pdf");
+    writeFileSync(file, "%PDF-1.4\n");
+    truncateSync(file, 150 * 1024 * 1024);
+
+    for (const value of ["0", "500"]) {
+      await withEnv("PAPERLESS_MCP_MAX_UPLOAD_MB", value, async () => {
+        await assert.doesNotReject(() => validateFilePath(file), value);
+      });
+    }
+  });
+
+  test("an invalid PAPERLESS_MCP_MAX_UPLOAD_MB falls back to the 100MB default", async () => {
+    const file = join(testDir, "over-default.pdf");
+    writeFileSync(file, "%PDF-1.4\n");
+    truncateSync(file, 101 * 1024 * 1024);
+
+    for (const value of ["abc", "-5", "", "Infinity"]) {
+      await withEnv("PAPERLESS_MCP_MAX_UPLOAD_MB", value, async () => {
+        await assert.rejects(() => validateFilePath(file), {
+          message: /maximum allowed size \(100MB\)/,
+        });
+      });
+    }
+  });
+
   test("accepts files within allowed upload paths", async () => {
     const validate = validateFilePathWithAllowlist(realpathSync(testDir));
     await assert.doesNotReject(() => validate(testFile));
@@ -448,7 +587,44 @@ describe("validateFilePath", () => {
       message: /outside allowed upload directories/,
     });
   });
+
+  test("applies the allowlist to the resolved path, including accent normalization", async () => {
+    const allowed = join(testDir, "Autorisé");
+    const elsewhere = join(testDir, "Ailleurs");
+    mkdirSync(allowed.normalize("NFD"));
+    mkdirSync(elsewhere);
+    const inside = join(allowed.normalize("NFD"), "ok.pdf");
+    const outside = join(elsewhere, "no.pdf");
+    writeFileSync(inside, "%PDF-1.4\nok");
+    writeFileSync(outside, "%PDF-1.4\nno");
+
+    const validate = validateFilePathWithAllowlist(allowed.normalize("NFC"));
+    assert.equal(
+      await validate(join(allowed, "ok.pdf").normalize("NFC")),
+      realpathSync(inside)
+    );
+    await assert.rejects(() => validate(outside), {
+      message: /outside allowed upload directories/,
+    });
+  });
+
+  test("rejects a symlink inside an allowed directory that points outside it", async () => {
+    const allowed = join(testDir, "allowed-links");
+    mkdirSync(allowed);
+    const link = join(allowed, "escape.pdf");
+    try {
+      symlinkSync(testFile, link);
+    } catch {
+      return;
+    }
+
+    const validate = validateFilePathWithAllowlist(allowed);
+    await assert.rejects(() => validate(link), {
+      message: /outside allowed upload directories/,
+    });
+  });
 });
+
 
 class TestTransport implements Transport {
   peer?: TestTransport;
@@ -485,10 +661,11 @@ function parseToolText(result: CallToolResult) {
 
 async function withDocumentClient(
   api: PaperlessAPI,
-  run: (client: Client) => Promise<void>
+  run: (client: Client) => Promise<void>,
+  register: typeof registerDocumentTools = registerDocumentTools
 ) {
   const server = new McpServer({ name: "paperless-doc-test", version: "1.0.0" });
-  registerDocumentTools(server, api);
+  register(server, api);
 
   const client = new Client({
     name: "paperless-doc-test-client",
@@ -906,4 +1083,524 @@ describe("nullable foreign keys can still be cleared (#138)", () => {
     assert.equal(data.owner, null);
   });
 
+});
+
+const sha256 = (data: Buffer | string) =>
+  createHash("sha256").update(data).digest("hex");
+const md5 = (data: Buffer | string) =>
+  createHash("md5").update(data).digest("hex");
+
+interface UploadedDocument {
+  document: Buffer | Readable;
+  content?: Buffer;
+  filename: string;
+  metadata: Record<string, unknown>;
+  knownLength?: number;
+}
+
+interface ExistingDocument {
+  id: number;
+  title: string;
+  checksum: string;
+}
+
+async function readAll(stream: Readable): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of stream) chunks.push(Buffer.from(chunk));
+  return Buffer.concat(chunks);
+}
+
+function createUploadApi(
+  documents: ExistingDocument[] = [],
+  { checksumInList = true, taskId = "task-uuid-1" } = {}
+) {
+  const calls = {
+    getDocuments: [] as string[],
+    request: [] as string[],
+    postDocument: [] as UploadedDocument[],
+  };
+  const emptyPage = { count: 0, next: null, previous: null, all: [] };
+  const api = {
+    getDocuments: async (query: string) => {
+      calls.getDocuments.push(query);
+      const wanted = getQueryParams(query).get("checksum__iexact");
+      if (wanted !== null) {
+        const hit = documents.find(
+          (doc) => doc.checksum.toLowerCase() === wanted.toLowerCase()
+        );
+        return {
+          ...emptyPage,
+          results: hit ? [{ id: hit.id, title: hit.title }] : [],
+        };
+      }
+      const newest = documents[documents.length - 1];
+      return {
+        ...emptyPage,
+        results: newest
+          ? [
+              checksumInList
+                ? { id: newest.id, checksum: newest.checksum }
+                : { id: newest.id },
+            ]
+          : [],
+      };
+    },
+    request: async (path: string) => {
+      calls.request.push(path);
+      return { original_checksum: documents[documents.length - 1]?.checksum };
+    },
+    postDocument: async (
+      document: Buffer | Readable,
+      filename: string,
+      metadata: Record<string, unknown>,
+      knownLength?: number
+    ) => {
+      const content = Buffer.isBuffer(document)
+        ? undefined
+        : await readAll(document);
+      calls.postDocument.push({ document, content, filename, metadata, knownLength });
+      return taskId;
+    },
+  } as unknown as PaperlessAPI;
+  return { api, calls };
+}
+
+describe("duplicate detection", () => {
+  let testDir: string;
+  const scanContent = Buffer.from("%PDF-1.4\nscan of a manual");
+  const otherContent = Buffer.from("%PDF-1.4\nsomething new");
+  let scanFile: string;
+  let otherFile: string;
+
+  before(() => {
+    testDir = mkdtempSync(join(tmpdir(), "paperless-mcp-dup-"));
+    scanFile = join(testDir, "scan.pdf");
+    otherFile = join(testDir, "other.pdf");
+    writeFileSync(scanFile, scanContent);
+    writeFileSync(otherFile, otherContent);
+  });
+
+  after(() => {
+    rmSync(testDir, { recursive: true, force: true });
+  });
+
+  async function checkDuplicates(
+    api: PaperlessAPI,
+    file_paths: string[],
+    register: typeof registerDocumentTools = registerDocumentTools
+  ) {
+    let result: CallToolResult | undefined;
+    await withDocumentClient(
+      api,
+      async (client) => {
+        result = (await client.callTool({
+          name: "check_duplicates",
+          arguments: { file_paths },
+        })) as CallToolResult;
+      },
+      register
+    );
+    assert.ok(result && !result.isError, "check_duplicates failed");
+    return parseToolText(result);
+  }
+
+  test("check_duplicates reports duplicates, new files and per-file errors", async () => {
+    const { api, calls } = createUploadApi([
+      { id: 11, title: "Old scan", checksum: sha256(scanContent) },
+    ]);
+    const missing = join(testDir, "missing.pdf");
+
+    const { results } = await checkDuplicates(api, [scanFile, otherFile, missing]);
+
+    assert.deepEqual(results.slice(0, 2), [
+      {
+        file_path: scanFile,
+        checksum: sha256(scanContent),
+        duplicate: true,
+        document: { id: 11, title: "Old scan" },
+      },
+      {
+        file_path: otherFile,
+        checksum: sha256(otherContent),
+        duplicate: false,
+        document: null,
+      },
+    ]);
+    assert.equal(results[2].file_path, missing);
+    assert.match(results[2].error, /^File not found: /);
+    assert.equal(
+      calls.getDocuments.filter((q) => !q.includes("checksum__iexact")).length,
+      1,
+      "the checksum algorithm must be detected once per call"
+    );
+    assert.deepEqual(
+      calls.getDocuments.filter((q) => q.includes("checksum__iexact")).map((q) => {
+        const params = getQueryParams(q);
+        return [params.get("checksum__iexact"), params.get("page_size")];
+      }),
+      [
+        [sha256(scanContent), "1"],
+        [sha256(otherContent), "1"],
+      ]
+    );
+  });
+
+  test("check_duplicates uses MD5 when the instance still stores 32-character checksums", async () => {
+    const { api } = createUploadApi([
+      { id: 3, title: "Legacy", checksum: md5(scanContent) },
+    ]);
+
+    const { results } = await checkDuplicates(api, [scanFile]);
+
+    assert.deepEqual(results, [
+      {
+        file_path: scanFile,
+        checksum: md5(scanContent),
+        duplicate: true,
+        document: { id: 3, title: "Legacy" },
+      },
+    ]);
+  });
+
+  test("falls back to the metadata endpoint when the list has no checksum field", async () => {
+    const { api, calls } = createUploadApi(
+      [{ id: 9, title: "Legacy", checksum: md5(scanContent) }],
+      { checksumInList: false }
+    );
+
+    const { results } = await checkDuplicates(api, [scanFile]);
+
+    assert.deepEqual(calls.request, ["/documents/9/metadata/"]);
+    assert.equal(results[0].checksum, md5(scanContent));
+    assert.equal(results[0].duplicate, true);
+  });
+
+  test("uses SHA-256 and finds nothing when the instance has no document", async () => {
+    const { api } = createUploadApi([]);
+
+    const { results } = await checkDuplicates(api, [scanFile]);
+
+    assert.deepEqual(results, [
+      {
+        file_path: scanFile,
+        checksum: sha256(scanContent),
+        duplicate: false,
+        document: null,
+      },
+    ]);
+  });
+
+  test("check_duplicates reports files outside the allowed upload directories per entry", async () => {
+    const allowedDir = join(testDir, "allowed");
+    mkdirSync(allowedDir);
+    const allowedFile = join(allowedDir, "in.pdf");
+    writeFileSync(allowedFile, scanContent);
+    const { registerDocumentTools: registerWithAllowlist } =
+      loadDocumentsWithAllowlist(realpathSync(allowedDir));
+    const { api } = createUploadApi([]);
+
+    const { results } = await checkDuplicates(
+      api,
+      [allowedFile, otherFile],
+      registerWithAllowlist
+    );
+
+    assert.equal(results[0].checksum, sha256(scanContent));
+    assert.deepEqual(results[1], {
+      file_path: otherFile,
+      error: results[1].error,
+    });
+    assert.match(results[1].error, /outside allowed upload directories/);
+  });
+
+  test("check_duplicates rejects empty lists and relative paths in the schema", async () => {
+    const { api, calls } = createUploadApi([]);
+
+    await withDocumentClient(api, async (client) => {
+      for (const file_paths of [[], ["relative/scan.pdf"]]) {
+        let rejected = false;
+        let result: CallToolResult | undefined;
+        try {
+          result = (await client.callTool({
+            name: "check_duplicates",
+            arguments: { file_paths },
+          })) as CallToolResult;
+        } catch {
+          rejected = true;
+        }
+        assert.ok(
+          rejected || result?.isError,
+          `expected ${JSON.stringify(file_paths)} to be rejected`
+        );
+      }
+    });
+
+    assert.equal(calls.getDocuments.length, 0);
+  });
+
+  async function postDocument(api: PaperlessAPI, args: Record<string, unknown>) {
+    let result: CallToolResult | undefined;
+    await withDocumentClient(api, async (client) => {
+      result = (await client.callTool({
+        name: "post_document",
+        arguments: args,
+      })) as CallToolResult;
+    });
+    assert.ok(result && !result.isError, "post_document failed");
+    return parseToolText(result);
+  }
+
+  test("post_document skip_if_duplicate returns the existing document without uploading (file_path)", async () => {
+    const { api, calls } = createUploadApi([
+      { id: 11, title: "Old scan", checksum: sha256(scanContent) },
+    ]);
+
+    const result = await postDocument(api, {
+      file_path: scanFile,
+      title: "Again",
+      skip_if_duplicate: true,
+    });
+
+    assert.deepEqual(result, {
+      duplicate: true,
+      document: { id: 11, title: "Old scan" },
+    });
+    assert.equal(calls.postDocument.length, 0);
+  });
+
+  test("post_document skip_if_duplicate hashes the decoded content (file)", async () => {
+    const { api, calls } = createUploadApi([
+      { id: 12, title: "Old scan", checksum: sha256(scanContent) },
+    ]);
+
+    const result = await postDocument(api, {
+      file: scanContent.toString("base64"),
+      filename: "scan.pdf",
+      skip_if_duplicate: true,
+    });
+
+    assert.deepEqual(result, {
+      duplicate: true,
+      document: { id: 12, title: "Old scan" },
+    });
+    assert.equal(calls.postDocument.length, 0);
+  });
+
+  test("post_document skip_if_duplicate uploads new content without leaking the flag into the metadata", async () => {
+    const { api, calls } = createUploadApi([
+      { id: 11, title: "Old scan", checksum: sha256(scanContent) },
+    ]);
+
+    const result = await postDocument(api, {
+      file_path: otherFile,
+      title: "Fresh",
+      tags: [2],
+      skip_if_duplicate: true,
+    });
+
+    assert.deepEqual(result, { status: "task-uuid-1" });
+    assert.equal(calls.postDocument.length, 1);
+    assert.deepEqual(calls.postDocument[0].metadata, { title: "Fresh", tags: [2] });
+  });
+
+  test("post_document does not look anything up unless skip_if_duplicate is set", async () => {
+    const { api, calls } = createUploadApi([
+      { id: 11, title: "Old scan", checksum: sha256(scanContent) },
+    ]);
+
+    await postDocument(api, { file_path: scanFile, title: "Again" });
+    await postDocument(api, { file_path: scanFile, skip_if_duplicate: false });
+
+    assert.equal(calls.getDocuments.length, 0);
+    assert.equal(calls.postDocument.length, 2);
+  });
+
+  test("post_document streams file_path uploads with their known length", async () => {
+    const { api, calls } = createUploadApi();
+
+    const result = await postDocument(api, { file_path: scanFile, title: "Scan" });
+
+    assert.deepEqual(result, { status: "task-uuid-1" });
+    const [upload] = calls.postDocument;
+    assert.ok(!Buffer.isBuffer(upload.document), "file_path uploads must be streamed");
+    assert.deepEqual(upload.content, scanContent);
+    assert.equal(upload.knownLength, scanContent.length);
+    assert.equal(upload.filename, basename(scanFile));
+    assert.deepEqual(upload.metadata, { title: "Scan" });
+  });
+
+  test("post_document sends base64 uploads as a buffer", async () => {
+    const { api, calls } = createUploadApi();
+
+    await postDocument(api, {
+      file: scanContent.toString("base64"),
+      filename: "scan.pdf",
+    });
+
+    const [upload] = calls.postDocument;
+    assert.ok(Buffer.isBuffer(upload.document));
+    assert.deepEqual(upload.document, scanContent);
+    assert.equal(upload.knownLength, undefined);
+  });
+
+  test("post_document still reports a numeric task result as an id", async () => {
+    const { api } = createUploadApi([], { taskId: "42" });
+
+    assert.deepEqual(await postDocument(api, { file_path: scanFile }), { id: 42 });
+  });
+
+  test("post_document applies PAPERLESS_MCP_MAX_UPLOAD_MB to base64 content", async () => {
+    const { api, calls } = createUploadApi();
+    const big = Buffer.alloc(2 * 1024 * 1024, 1);
+
+    await withEnv("PAPERLESS_MCP_MAX_UPLOAD_MB", "1", async () => {
+      await withDocumentClient(api, async (client) => {
+        const result = (await client.callTool({
+          name: "post_document",
+          arguments: { file: big.toString("base64"), filename: "big.pdf" },
+        })) as CallToolResult;
+        assert.ok(result.isError);
+        assert.match(
+          parseToolText(result).error,
+          /File size \(2MB\) exceeds maximum allowed size \(1MB\).*PAPERLESS_MCP_MAX_UPLOAD_MB/
+        );
+      });
+    });
+
+    assert.equal(calls.postDocument.length, 0);
+  });
+});
+
+interface ReceivedUpload {
+  url: string | undefined;
+  headers: IncomingHttpHeaders;
+  body: Buffer;
+}
+
+async function withUploadServer(
+  respond: (
+    req: IncomingMessage,
+    res: ServerResponse,
+    received: Promise<ReceivedUpload>
+  ) => void,
+  run: (baseUrl: string) => Promise<void>
+) {
+  const server = createServer((req, res) => {
+    const received = new Promise<ReceivedUpload>((resolve, reject) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (chunk: Buffer) => chunks.push(chunk));
+      req.on("end", () =>
+        resolve({ url: req.url, headers: req.headers, body: Buffer.concat(chunks) })
+      );
+      req.on("error", reject);
+    });
+    respond(req, res, received);
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    await run(`http://127.0.0.1:${(server.address() as AddressInfo).port}`);
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+}
+
+describe("post_document file_path streaming over HTTP", () => {
+  let testDir: string;
+  let bigFile: string;
+  let content: Buffer;
+
+  before(() => {
+    testDir = mkdtempSync(join(tmpdir(), "paperless-mcp-stream-"));
+    bigFile = join(testDir, "manual.pdf");
+    content = Buffer.concat([Buffer.from("%PDF-1.4\n"), randomBytes(6 * 1024 * 1024)]);
+    writeFileSync(bigFile, content);
+  });
+
+  after(() => {
+    rmSync(testDir, { recursive: true, force: true });
+  });
+
+  function callPostDocument(baseUrl: string) {
+    return withDocumentResult(
+      new PaperlessAPI(baseUrl, "test-token"),
+      { file_path: bigFile, title: "Manual" }
+    );
+  }
+
+  async function withDocumentResult(api: PaperlessAPI, args: Record<string, unknown>) {
+    let result: CallToolResult | undefined;
+    await withDocumentClient(api, async (client) => {
+      result = (await client.callTool({
+        name: "post_document",
+        arguments: args,
+      })) as CallToolResult;
+    });
+    assert.ok(result);
+    return result;
+  }
+
+  test("sends every byte with a Content-Length instead of chunked encoding", async () => {
+    let upload: ReceivedUpload | undefined;
+    await withUploadServer(
+      (req, res, received) => {
+        received.then((value) => {
+          upload = value;
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify("7b6a3c1e-task"));
+        });
+      },
+      async (baseUrl) => {
+        const result = await callPostDocument(baseUrl);
+        assert.ok(!result.isError, JSON.stringify(result.content));
+        assert.deepEqual(parseToolText(result), { status: "7b6a3c1e-task" });
+      }
+    );
+
+    assert.ok(upload);
+    assert.equal(upload.url, "/api/documents/post_document/");
+    assert.equal(upload.headers["transfer-encoding"], undefined);
+    assert.equal(Number(upload.headers["content-length"]), upload.body.length);
+    assert.ok(
+      upload.body.length > content.length &&
+        upload.body.length < content.length + 2048,
+      "the body is the file plus multipart framing"
+    );
+    assert.ok(upload.body.includes(content), "the file must arrive unchanged");
+  });
+
+  for (const [name, answerAfterBody] of [
+    ["after reading the body", true],
+    ["before reading the body", false],
+  ] as const) {
+    test(`reports a redirect answered ${name} as an error pointing at PAPERLESS_URL`, async () => {
+      const redirects: string[] = [];
+      await withUploadServer(
+        (req, res, received) => {
+          const redirect = () => {
+            redirects.push(req.url ?? "");
+            res.writeHead(301, {
+              Location: "https://paperless.example.test/api/documents/post_document/",
+            });
+            res.end();
+          };
+          if (answerAfterBody) {
+            received.then(redirect);
+          } else {
+            redirect();
+          }
+        },
+        async (baseUrl) => {
+          const result = await callPostDocument(baseUrl);
+          assert.ok(result.isError, "a redirected upload must fail");
+          const { error } = parseToolText(result);
+          assert.match(error, /HTTP 301/);
+          assert.match(error, /redirected the upload to https:\/\/paperless\.example\.test/);
+          assert.match(error, /PAPERLESS_URL/);
+        }
+      );
+
+      assert.deepEqual(redirects, ["/api/documents/post_document/"]);
+    });
+  }
 });

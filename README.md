@@ -67,7 +67,8 @@ Add these to your MCP config file:
 | `PAPERLESS_API_KEY` | Yes | — | API token from your Paperless-NGX profile |
 | `PAPERLESS_PUBLIC_URL` | No | `PAPERLESS_URL` | Public-facing URL for document links |
 | `PAPERLESS_API_VERSION` | No | `9` | Paperless-ngx REST API version. `9` works on Paperless-ngx v2.x (recent) and v3.x. Paperless-ngx v3.0.0 dropped support for versions below `9`, so older defaults now return HTTP 406. If you see HTTP 406 errors, set this to a version your server supports. |
-| `PAPERLESS_MCP_UPLOAD_PATHS` | No | — | Colon-separated list of allowed directories for `file_path` uploads. **Recommended for security.** Example: `/var/uploads:/tmp/scans` |
+| `PAPERLESS_MCP_UPLOAD_PATHS` | No | — | List of allowed directories for `file_path` uploads, separated by `:` on Linux/macOS and `;` on Windows. **Recommended for security.** Example: `/var/uploads:/tmp/scans`, or `Z:\Manuels;D:\Scans` on Windows |
+| `PAPERLESS_MCP_MAX_UPLOAD_MB` | No | `100` | Maximum size in MB of a file uploaded with `post_document`. `0` removes the limit. |
 
 That's it! Now you can ask Claude to help you manage your Paperless-NGX documents.
 
@@ -328,7 +329,9 @@ Upload a new document to Paperless-NGX.
 1. **Base64 mode** (traditional): Provide `file` (base64-encoded content) + `filename`
 2. **Filesystem mode** (efficient): Provide `file_path` (absolute path on server)
 
-**Security Note:** When using `file_path`, set the `PAPERLESS_MCP_UPLOAD_PATHS` environment variable (colon-separated list of allowed directories) to restrict uploads to specific locations. Without this, any file on the server's filesystem could be uploaded.
+**Security Note:** When using `file_path`, set the `PAPERLESS_MCP_UPLOAD_PATHS` environment variable (list of allowed directories, separated by `:` on Linux/macOS and `;` on Windows) to restrict uploads to specific locations. Without this, any file on the server's filesystem could be uploaded. Paths are matched after resolving symlinks, and file names are found whether their accents are stored in composed (NFC) or decomposed (NFD) form.
+
+**Large files and redirects:** `file_path` uploads are streamed to Paperless-NGX instead of being loaded in memory, so use them for big files (raise `PAPERLESS_MCP_MAX_UPLOAD_MB` above the default 100). A streamed upload cannot be replayed, so it does not follow HTTP redirects: the configured `PAPERLESS_URL` must be the final URL. A redirect (for example `http://` to `https://`) is reported as an error telling you to fix `PAPERLESS_URL`. A reverse proxy in front of Paperless-NGX may still need a larger body limit (for example nginx `client_max_body_size`).
 
 Parameters:
 - file (optional): Base64 encoded file content. Either `file` or `file_path` required.
@@ -342,8 +345,11 @@ Parameters:
 - tags (optional): Array of tag IDs
 - archive_serial_number (optional): Archive serial number
 - custom_fields (optional): Array of custom field IDs
+- skip_if_duplicate (optional): When `true`, the file's checksum is looked up first and, if a document with the same checksum already exists, `{ duplicate: true, document: { id, title } }` is returned without uploading. Default `false`.
 
-**File size limit:** 100MB for both modes
+**File size limit:** 100MB for both modes by default, configurable with `PAPERLESS_MCP_MAX_UPLOAD_MB` (`0` = unlimited). Base64 mode holds the whole file in memory.
+
+The result is the import task UUID (`status`), not a document id: Paperless-NGX imports asynchronously.
 
 ```typescript
 // Base64 mode (traditional)
@@ -367,6 +373,22 @@ post_document({
   document_type: 2,
   tags: [1, 3]
 })
+```
+
+#### check_duplicates
+Check whether files on the server's filesystem already exist in Paperless-NGX, without uploading anything. Each file is hashed (SHA-256, or MD5 on older instances; detected automatically) and looked up by checksum, which matches the original file of a document. Paths follow the same rules as `post_document`'s `file_path`. Only documents visible to the API token are found, and a file whose checksum equals an existing document's archive (processed) file is not detected, although Paperless-NGX would reject it.
+
+Parameters:
+- file_paths: Array of absolute file paths (at least one)
+
+One unreadable or disallowed file does not fail the batch: its entry carries an `error`.
+
+```typescript
+check_duplicates({ file_paths: ["/var/uploads/invoice.pdf", "/var/uploads/receipt.pdf"] })
+// { results: [
+//   { file_path: "/var/uploads/invoice.pdf", checksum: "…", duplicate: true, document: { id: 12, title: "Invoice" } },
+//   { file_path: "/var/uploads/receipt.pdf", checksum: "…", duplicate: false, document: null }
+// ] }
 ```
 
 ### Document Notes

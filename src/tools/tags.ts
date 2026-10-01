@@ -7,7 +7,17 @@ import {
 } from "../api/utils";
 import { matchingAlgorithmSchema } from "./utils/matchingAlgorithm";
 import { withErrorHandling } from "./utils/middlewares";
+import { ownerSchema, setPermissionsSchema } from "./utils/permissions";
 import { buildQueryString } from "./utils/queryString";
+
+const tagParentSchema = z
+  .number()
+  .int()
+  .nullable()
+  .optional()
+  .describe(
+    "ID of the parent tag. On update, null detaches the tag from its parent and omitted leaves it unchanged."
+  );
 
 export function registerTagTools(server: McpServer, api: PaperlessAPI) {
   server.tool(
@@ -47,7 +57,7 @@ export function registerTagTools(server: McpServer, api: PaperlessAPI) {
 
   server.tool(
     "create_tag",
-    "Create a new tag with optional color, matching pattern, and matching algorithm for automatic document tagging.",
+    "Create a new tag with optional color, matching pattern, matching algorithm for automatic document tagging, parent tag, owner, and permissions.",
     {
       name: z.string(),
       color: z
@@ -56,6 +66,9 @@ export function registerTagTools(server: McpServer, api: PaperlessAPI) {
         .optional(),
       match: z.string().optional(),
       matching_algorithm: matchingAlgorithmSchema.optional(),
+      parent: tagParentSchema,
+      owner: ownerSchema,
+      set_permissions: setPermissionsSchema,
     },
     withErrorHandling(async (args, extra) => {
       if (!api) throw new Error("Please configure API connection first");
@@ -74,20 +87,24 @@ export function registerTagTools(server: McpServer, api: PaperlessAPI) {
 
   server.tool(
     "update_tag",
-    "Update an existing tag's name, color, matching pattern, or matching algorithm.",
+    "Update an existing tag. Partial update: only the arguments you pass are changed, omitted fields keep their current value. Can change name, color, matching pattern, matching algorithm, parent tag, owner, and permissions.",
     {
       id: z.number(),
-      name: z.string(),
+      name: z.string().optional(),
       color: z
         .string()
         .regex(/^#[0-9A-Fa-f]{6}$/)
         .optional(),
       match: z.string().optional(),
       matching_algorithm: matchingAlgorithmSchema.optional(),
+      parent: tagParentSchema,
+      owner: ownerSchema,
+      set_permissions: setPermissionsSchema,
     },
     withErrorHandling(async (args, extra) => {
       if (!api) throw new Error("Please configure API connection first");
-      const tag = await api.updateTag(args.id, args);
+      const { id, ...data } = args;
+      const tag = await api.updateTag(id, data);
       const enhancedTag = enhanceMatchingAlgorithm(tag);
       return {
         content: [

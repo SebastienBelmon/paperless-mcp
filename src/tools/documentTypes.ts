@@ -7,6 +7,7 @@ import {
 } from "../api/utils";
 import { matchingAlgorithmSchema } from "./utils/matchingAlgorithm";
 import { withErrorHandling } from "./utils/middlewares";
+import { ownerSchema, setPermissionsSchema } from "./utils/permissions";
 import { buildQueryString } from "./utils/queryString";
 
 export function registerDocumentTypeTools(
@@ -64,11 +65,13 @@ export function registerDocumentTypeTools(
 
   server.tool(
     "create_document_type",
-    "Create a new document type with optional matching pattern and algorithm for automatic document classification.",
+    "Create a new document type with optional matching pattern and algorithm for automatic document classification, owner, and permissions.",
     {
       name: z.string(),
       match: z.string().optional(),
       matching_algorithm: matchingAlgorithmSchema.optional(),
+      owner: ownerSchema,
+      set_permissions: setPermissionsSchema,
     },
     withErrorHandling(async (args, extra) => {
       if (!api) throw new Error("Please configure API connection first");
@@ -82,12 +85,14 @@ export function registerDocumentTypeTools(
 
   server.tool(
     "update_document_type",
-    "Update an existing document type's name, matching pattern, or matching algorithm.",
+    "Update an existing document type's name, matching pattern, matching algorithm, owner, or permissions. Optional arguments that are omitted keep their current value.",
     {
       id: z.number(),
       name: z.string(),
       match: z.string().optional(),
       matching_algorithm: matchingAlgorithmSchema.optional(),
+      owner: ownerSchema,
+      set_permissions: setPermissionsSchema,
     },
     withErrorHandling(async (args, extra) => {
       if (!api) throw new Error("Please configure API connection first");

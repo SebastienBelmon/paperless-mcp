@@ -1,10 +1,17 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp";
 import { z } from "zod";
-import { readFile, access, stat, realpath } from "fs/promises";
-import { constants } from "fs";
+import { access, stat } from "fs/promises";
+import { constants, createReadStream } from "fs";
 import { basename, isAbsolute } from "path";
 import { convertDocsWithNames } from "../api/documentEnhancer";
 import { PaperlessAPI } from "../api/PaperlessAPI";
+import {
+  bufferChecksum,
+  detectChecksumAlgorithm,
+  DuplicateDocument,
+  fileChecksum,
+  findDocumentByChecksum,
+} from "./utils/duplicates";
 import { arrayNotEmpty } from "./utils/empty";
 import {
   BuildDocumentQueryArgs,
@@ -13,6 +20,14 @@ import {
   QUERY_DOCUMENTS_ARGS_SHAPE,
   SEARCH_DOCUMENTS_ARGS_SHAPE,
 } from "./utils/documentQuery";
+import {
+  assertAbsolutePath,
+  assertWithinUploadLimit,
+  isPathAllowed,
+  parseUploadPaths,
+  resolveAllowedDirs,
+  resolveExistingPath,
+} from "./utils/filePath";
 import { withErrorHandling } from "./utils/middlewares";
 import { validateCustomFields } from "./utils/monetary";
 import { resolveSelectCustomFieldValues } from "./utils/selectFields";
@@ -34,31 +49,22 @@ export type BulkCustomFieldParameters = {
   remove_custom_fields?: number[];
 };
 
-const MAX_FILE_SIZE_BYTES = 100 * 1024 * 1024;
+const ALLOWED_UPLOAD_PATHS = parseUploadPaths(
+  process.env.PAPERLESS_MCP_UPLOAD_PATHS
+);
 
-const ALLOWED_UPLOAD_PATHS = process.env.PAPERLESS_MCP_UPLOAD_PATHS
-  ? process.env.PAPERLESS_MCP_UPLOAD_PATHS.split(":")
-  : [];
+/**
+ * Validates that a file path is safe to read for document upload.
+ * @returns The resolved real path of the file, which callers must read.
+ */
+export async function validateFilePath(filePath: string): Promise<string> {
+  assertAbsolutePath(filePath);
 
-/** Validates that a file path is safe to read for document upload. */
-export async function validateFilePath(filePath: string): Promise<void> {
-  if (!isAbsolute(filePath)) {
-    throw new Error("file_path must be an absolute path");
-  }
-
-  // Resolve symlinks to get canonical path for allowlist checks
-  let realPath: string;
-  try {
-    realPath = await realpath(filePath);
-  } catch {
-    throw new Error("File not found");
-  }
+  const realPath = await resolveExistingPath(filePath);
 
   if (ALLOWED_UPLOAD_PATHS.length > 0) {
-    const isAllowed = ALLOWED_UPLOAD_PATHS.some((allowedPath) => {
-      return realPath.startsWith(allowedPath + "/") || realPath === allowedPath;
-    });
-    if (!isAllowed) {
+    const allowedDirs = await resolveAllowedDirs(ALLOWED_UPLOAD_PATHS);
+    if (!isPathAllowed(realPath, allowedDirs)) {
       throw new Error(
         "file_path is outside allowed upload directories. " +
         "Configure PAPERLESS_MCP_UPLOAD_PATHS environment variable to specify allowed paths."
@@ -72,15 +78,13 @@ export async function validateFilePath(filePath: string): Promise<void> {
     throw new Error("Path must point to a regular file");
   }
 
-  if (stats.size > MAX_FILE_SIZE_BYTES) {
-    throw new Error(
-      `File size (${Math.round(stats.size / 1024 / 1024)}MB) exceeds maximum allowed size (${MAX_FILE_SIZE_BYTES / 1024 / 1024}MB)`
-    );
-  }
+  assertWithinUploadLimit(stats.size);
 
   if (stats.size === 0) {
     throw new Error("File is empty");
   }
+
+  return realPath;
 }
 
 /**
@@ -136,6 +140,23 @@ export function buildBulkEditParameters<T extends Record<string, unknown>>(
   }
 
   return apiParameters;
+}
+
+type UploadSource =
+  | { kind: "buffer"; data: Buffer }
+  | { kind: "file"; path: string; size: number };
+
+type DuplicateCheckResult =
+  | {
+      file_path: string;
+      checksum: string;
+      duplicate: boolean;
+      document: DuplicateDocument | null;
+    }
+  | { file_path: string; error: string };
+
+function jsonResult(value: unknown) {
+  return { content: [{ type: "text" as const, text: JSON.stringify(value) }] };
 }
 
 async function executeDocumentQuery(
@@ -296,7 +317,7 @@ export function registerDocumentTools(server: McpServer, api: PaperlessAPI) {
   );
 
   const postDocumentBaseSchema = z.object({
-    file: z.string().optional().describe("Base64-encoded file content. Either 'file' or 'file_path' must be provided."),
+    file: z.string().optional().describe("Base64-encoded file content. Either 'file' or 'file_path' must be provided. The whole file is held in memory: use 'file_path' for large files."),
     file_path: z.string().optional().describe("Absolute path to a file on the server's filesystem. Either 'file' or 'file_path' must be provided. The filename is derived from the path unless 'filename' is also specified. For security, configure PAPERLESS_MCP_UPLOAD_PATHS to restrict allowed directories."),
     filename: z.string().optional().describe("Filename for the uploaded document. Required when using 'file', optional when using 'file_path' (defaults to the basename of the path)."),
     title: z.string().optional(),
@@ -307,6 +328,12 @@ export function registerDocumentTools(server: McpServer, api: PaperlessAPI) {
     tags: z.array(z.number()).optional(),
     archive_serial_number: z.number().optional(),
     custom_fields: z.array(z.number()).optional(),
+    skip_if_duplicate: z
+      .boolean()
+      .optional()
+      .describe(
+        "When true, look the file's checksum up first and, if a document with the same checksum already exists, return { duplicate: true, document: { id, title } } without uploading. Default false. Paperless also rejects a file whose checksum equals an existing document's archive file checksum, which this lookup cannot find."
+      ),
   });
 
   const postDocumentSchema = postDocumentBaseSchema.superRefine((data, ctx) => {
@@ -358,7 +385,7 @@ export function registerDocumentTools(server: McpServer, api: PaperlessAPI) {
 
   server.tool(
     "post_document",
-    "Upload a new document to Paperless-NGX with optional metadata like title, correspondent, document type, tags, and custom fields. Provide either 'file' (base64-encoded content) or 'file_path' (absolute path to a file on the server's filesystem). Using file_path avoids base64 encoding overhead for large files. SECURITY: When using file_path, set PAPERLESS_MCP_UPLOAD_PATHS environment variable to restrict uploads to specific directories (colon-separated paths).",
+    "Upload a new document to Paperless-NGX with optional metadata like title, correspondent, document type, tags, and custom fields. Provide either 'file' (base64-encoded content) or 'file_path' (absolute path to a file on the server's filesystem). Using file_path avoids base64 encoding overhead for large files: it is streamed to Paperless-NGX instead of being loaded in memory, whereas 'file' is held in memory. The maximum file size is 100MB unless PAPERLESS_MCP_MAX_UPLOAD_MB is set (0 = unlimited). Paperless-NGX imports the document asynchronously: the returned value is not a document id, 'status' is the import task UUID. Follow it with 'get_task' or 'wait_for_tasks' to get the outcome. Pass skip_if_duplicate: true to skip the upload when a document with the same checksum already exists, or use 'check_duplicates' to check files beforehand. SECURITY: When using file_path, set PAPERLESS_MCP_UPLOAD_PATHS environment variable to restrict uploads to specific directories (separated by ':' on Linux/macOS, ';' on Windows).",
     postDocumentBaseSchema.shape,
     withErrorHandling(async (args, extra) => {
       if (!api) throw new Error("Please configure API connection first");
@@ -368,15 +395,15 @@ export function registerDocumentTools(server: McpServer, api: PaperlessAPI) {
         throw new Error(validationResult.error.issues.map(e => e.message).join("; "));
       }
 
-      let document: Buffer;
+      let source: UploadSource;
       let filename: string;
 
       if (args.file_path) {
-        await validateFilePath(args.file_path);
+        const realPath = await validateFilePath(args.file_path);
 
         try {
-          document = await readFile(args.file_path);
-        } catch (err) {
+          await access(realPath, constants.R_OK);
+        } catch {
           throw new Error("Failed to read file");
         }
 
@@ -384,6 +411,7 @@ export function registerDocumentTools(server: McpServer, api: PaperlessAPI) {
         if (!filename) {
           throw new Error("Could not derive filename from file_path");
         }
+        source = { kind: "file", path: realPath, size: (await stat(realPath)).size };
       } else if (args.file) {
         const base64Regex = /^[A-Za-z0-9+/]*={0,2}$/;
         if (!base64Regex.test(args.file)) {
@@ -392,40 +420,87 @@ export function registerDocumentTools(server: McpServer, api: PaperlessAPI) {
           );
         }
 
-        document = Buffer.from(args.file, "base64");
+        const data = Buffer.from(args.file, "base64");
 
-        if (document.length > MAX_FILE_SIZE_BYTES) {
-          throw new Error(
-            `File size (${Math.round(document.length / 1024 / 1024)}MB) exceeds maximum allowed size (${MAX_FILE_SIZE_BYTES / 1024 / 1024}MB)`
-          );
-        }
-        if (document.length === 0) {
+        assertWithinUploadLimit(data.length);
+        if (data.length === 0) {
           throw new Error("File is empty");
         }
 
         filename = args.filename!;
+        source = { kind: "buffer", data };
       } else {
         // This should never happen due to schema validation, but TypeScript needs it
         throw new Error("Either 'file' (base64) or 'file_path' must be provided.");
       }
 
-      const { file, file_path, filename: _fn, ...metadata } = args;
+      if (args.skip_if_duplicate) {
+        const algorithm = await detectChecksumAlgorithm(api);
+        const checksum =
+          source.kind === "file"
+            ? await fileChecksum(source.path, algorithm)
+            : bufferChecksum(source.data, algorithm);
+        const duplicate = await findDocumentByChecksum(api, checksum);
+        if (duplicate) {
+          return jsonResult({ duplicate: true, document: duplicate });
+        }
+      }
 
-      const response = await api.postDocument(document, filename, metadata);
+      const { file, file_path, filename: _fn, skip_if_duplicate, ...metadata } = args;
+
+      const response =
+        source.kind === "file"
+          ? await api.postDocument(
+              createReadStream(source.path),
+              filename,
+              metadata,
+              source.size
+            )
+          : await api.postDocument(source.data, filename, metadata);
       let result;
       if (typeof response === "string" && /^\d+$/.test(response)) {
         result = { id: Number(response) };
       } else {
         result = { status: response };
       }
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(result),
-          },
-        ],
-      };
+      return jsonResult(result);
+    })
+  );
+
+  server.tool(
+    "check_duplicates",
+    "Check whether files on the server's filesystem already exist in Paperless-NGX before uploading them. Read-only: nothing is uploaded or modified. Each file is hashed (SHA-256, or MD5 on older Paperless-NGX instances; detected automatically) and looked up by checksum, which matches the original file of a document. Only documents visible to the API token are found. Paperless-NGX also rejects a file whose checksum equals an existing document's archive (processed) file checksum, which this lookup cannot find. Paths follow the same rules as post_document's file_path (absolute, PAPERLESS_MCP_UPLOAD_PATHS allowlist). One unreadable or disallowed file does not fail the batch: its entry carries an 'error' instead. Returns { results: [{ file_path, checksum, duplicate, document: { id, title } | null } | { file_path, error }] }.",
+    {
+      file_paths: z
+        .array(
+          z
+            .string()
+            .refine((filePath) => isAbsolute(filePath), {
+              message: "file_paths entries must be absolute paths",
+            })
+        )
+        .min(1)
+        .describe("Absolute paths of the files to check."),
+    },
+    withErrorHandling(async (args, extra) => {
+      if (!api) throw new Error("Please configure API connection first");
+
+      const algorithm = await detectChecksumAlgorithm(api);
+      const results: DuplicateCheckResult[] = [];
+      for (const file_path of args.file_paths) {
+        try {
+          const realPath = await validateFilePath(file_path);
+          const checksum = await fileChecksum(realPath, algorithm);
+          const document = await findDocumentByChecksum(api, checksum);
+          results.push({ file_path, checksum, duplicate: document !== null, document });
+        } catch (err) {
+          results.push({
+            file_path,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+      return jsonResult({ results });
     })
   );
 
@@ -441,7 +516,7 @@ export function registerDocumentTools(server: McpServer, api: PaperlessAPI) {
 
   server.tool(
     "query_documents",
-    "Query documents using the full-text query engine plus structured Paperless filters. Use this for complex filtering, custom field conditions, or any documented /api/documents/ query parameters that are not exposed as first-class arguments. Prefer the dedicated top-level arguments where available. custom_field_query supports [field_name_or_id, operator, value] leaves or ['AND'|'OR', [clause1, clause2]] groups. Note: Document content is excluded from results by default. Use 'get_document_content' when you need the document text. Pass 'fields' to return only the fields you need and keep results small.",
+    "Query documents using the full-text query engine plus structured Paperless filters. Use this for complex filtering, custom field conditions, or any documented /api/documents/ query parameters that are not exposed as first-class arguments. Prefer the dedicated top-level arguments where available. paperless_filters accepts only the keys documented by /api/documents/ (Paperless-NGX silently ignores unknown filters and would return every document), so id__gt/id__lt do not exist: use ordering '-id' with page_size, added__date__gt/added__date__gte, or id__in. custom_field_query supports [field_name_or_id, operator, value] leaves or ['AND'|'OR', [clause1, clause2]] groups. Note: Document content is excluded from results by default. Use 'get_document_content' when you need the document text. Pass 'fields' to return only the fields you need and keep results small.",
     QUERY_DOCUMENTS_ARGS_SHAPE,
     withErrorHandling(async (args, extra) => {
       if (!api) throw new Error("Please configure API connection first");

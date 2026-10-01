@@ -321,6 +321,22 @@ const DOCUMENT_QUERY_PAPERLESS_FILTER_KEY_SET: ReadonlySet<string> = new Set(
   DOCUMENT_QUERY_PAPERLESS_FILTER_KEYS
 );
 
+const ID_RANGE_FILTER_KEYS: ReadonlySet<string> = new Set([
+  "id__gt",
+  "id__gte",
+  "id__lt",
+  "id__lte",
+]);
+
+function unsupportedFilterMessage(key: string): string {
+  const message =
+    `Unsupported paperless_filters key '${key}'. Paperless-ngx does not document that filter and silently ignores unknown filters, ` +
+    `which would return all documents. Use documented /api/documents/ query parameter names only.`;
+  return ID_RANGE_FILTER_KEYS.has(key)
+    ? `${message} There is no id range filter: use ordering '-id' with page_size, 'added__date__gt' / 'added__date__gte', or 'id__in'.`
+    : message;
+}
+
 function hasValue<T>(value: T | null | undefined): value is T {
   return value !== undefined && value !== null;
 }
@@ -376,9 +392,7 @@ export function buildDocumentQueryString(args: BuildDocumentQueryArgs): string {
 
   for (const [key, value] of Object.entries(args.paperless_filters)) {
     if (!DOCUMENT_QUERY_PAPERLESS_FILTER_KEY_SET.has(key)) {
-      throw new Error(
-        `Unsupported paperless_filters key '${key}'. Use documented /api/documents/ query parameter names only.`
-      );
+      throw new Error(unsupportedFilterMessage(key));
     }
 
     if (firstClassKeys.has(key)) {
