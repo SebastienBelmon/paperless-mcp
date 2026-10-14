@@ -1,5 +1,6 @@
 import axios, { AxiosResponse } from "axios";
 import FormData from "form-data";
+import { Readable } from "stream";
 import {
   BulkEditDocumentsResult,
   BulkEditParameters,
@@ -16,8 +17,12 @@ import {
   MailAccount,
   MailRule,
   GetTagsResponse,
+  GetWorkflowsResponse,
   Note,
+  ObjectWriteFields,
+  PaperlessTask,
   Tag,
+  Workflow,
 } from "./types";
 import { headersToObject } from "./utils";
 
@@ -106,13 +111,20 @@ export class PaperlessAPI {
     });
   }
 
+  /**
+   * Upload a document. A Readable is streamed (not buffered) and never follows
+   * redirects: the stream can only be sent once, so a redirect is reported as an error.
+   * @param knownLength - Byte size of a streamed document, used for Content-Length.
+   * @returns The Celery task UUID of the import (follow it with GET /tasks/?task_id=).
+   */
   async postDocument(
-    document: Buffer,
+    document: Buffer | Readable,
     filename: string,
-    metadata: Record<string, string | string[] | number | number[] | undefined> = {}
+    metadata: Record<string, string | string[] | number | number[] | undefined> = {},
+    knownLength?: number
   ): Promise<string> {
     const formData = new FormData();
-    formData.append("document", document, { filename });
+    formData.append("document", document, { filename, knownLength });
 
     // Add optional metadata fields
     if (metadata.title) formData.append("title", metadata.title);
@@ -150,6 +162,7 @@ export class PaperlessAPI {
             Accept: `application/json; version=${this.apiVersion}`,
             ...formData.getHeaders(),
           },
+          ...(Buffer.isBuffer(document) ? {} : { maxRedirects: 0 }),
         }
       );
 
@@ -159,6 +172,19 @@ export class PaperlessAPI {
 
       return response.data;
     } catch (error) {
+      if (
+        axios.isAxiosError(error) &&
+        error.response &&
+        error.response.status >= 300 &&
+        error.response.status < 400
+      ) {
+        const location = error.response.headers?.location;
+        throw new Error(
+          `HTTP ${error.response.status}: Paperless-ngx redirected the upload${location ? ` to ${location}` : ""}. ` +
+            `Streamed uploads do not follow redirects. Set PAPERLESS_URL to the final URL ` +
+            `(for example https:// instead of http://, or the host name the server redirects to).`
+        );
+      }
       if (axios.isAxiosError(error) && error.response?.status === 406) {
         throw new Error(
           `HTTP 406: Paperless-ngx rejected API version ${this.apiVersion}. ` +
@@ -255,14 +281,17 @@ export class PaperlessAPI {
     return this.request<GetTagsResponse>("/tags/");
   }
 
-  async createTag(data: Partial<Tag>): Promise<Tag> {
+  async createTag(data: Partial<Tag> & ObjectWriteFields): Promise<Tag> {
     return this.request<Tag>("/tags/", {
       method: "POST",
       body: JSON.stringify(data),
     });
   }
 
-  async updateTag(id: number, data: Partial<Tag>): Promise<Tag> {
+  async updateTag(
+    id: number,
+    data: Partial<Tag> & ObjectWriteFields
+  ): Promise<Tag> {
     return this.request<Tag>(`/tags/${id}/`, {
       method: "PATCH",
       body: JSON.stringify(data),
@@ -290,7 +319,7 @@ export class PaperlessAPI {
   }
 
   async createCorrespondent(
-    data: Partial<Correspondent>
+    data: Partial<Correspondent> & ObjectWriteFields
   ): Promise<Correspondent> {
     return this.request<Correspondent>("/correspondents/", {
       method: "POST",
@@ -300,7 +329,7 @@ export class PaperlessAPI {
 
   async updateCorrespondent(
     id: number,
-    data: Partial<Correspondent>
+    data: Partial<Correspondent> & ObjectWriteFields
   ): Promise<Correspondent> {
     return this.request<Correspondent>(`/correspondents/${id}/`, {
       method: "PATCH",
@@ -319,7 +348,9 @@ export class PaperlessAPI {
     return this.request<GetDocumentTypesResponse>("/document_types/");
   }
 
-  async createDocumentType(data: Partial<DocumentType>): Promise<DocumentType> {
+  async createDocumentType(
+    data: Partial<DocumentType> & ObjectWriteFields
+  ): Promise<DocumentType> {
     return this.request<DocumentType>("/document_types/", {
       method: "POST",
       body: JSON.stringify(data),
@@ -328,7 +359,7 @@ export class PaperlessAPI {
 
   async updateDocumentType(
     id: number,
-    data: Partial<DocumentType>
+    data: Partial<DocumentType> & ObjectWriteFields
   ): Promise<DocumentType> {
     return this.request<DocumentType>(`/document_types/${id}/`, {
       method: "PATCH",
@@ -420,6 +451,36 @@ export class PaperlessAPI {
   async deleteCustomField(id: number): Promise<void> {
     return this.request<void>(`/custom_fields/${id}/`, {
       method: "DELETE",
+    });
+  }
+
+  // Task operations
+  async getTasks(taskId?: string): Promise<PaperlessTask[]> {
+    const query = taskId ? `?task_id=${encodeURIComponent(taskId)}` : "";
+    return this.request<PaperlessTask[]>(`/tasks/${query}`);
+  }
+
+  // Workflow operations (no delete on purpose)
+  async getWorkflows(queryString?: string): Promise<GetWorkflowsResponse> {
+    const url = queryString ? `/workflows/?${queryString}` : "/workflows/";
+    return this.request<GetWorkflowsResponse>(url);
+  }
+
+  async getWorkflow(id: number): Promise<Workflow> {
+    return this.request<Workflow>(`/workflows/${id}/`);
+  }
+
+  async createWorkflow(data: Partial<Workflow>): Promise<Workflow> {
+    return this.request<Workflow>("/workflows/", {
+      method: "POST",
+      body: JSON.stringify(data),
+    });
+  }
+
+  async updateWorkflow(id: number, data: Partial<Workflow>): Promise<Workflow> {
+    return this.request<Workflow>(`/workflows/${id}/`, {
+      method: "PATCH",
+      body: JSON.stringify(data),
     });
   }
 

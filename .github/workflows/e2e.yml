@@ -15,6 +15,12 @@ jobs:
     name: e2e (Paperless ${{ matrix.series }})
     runs-on: ubuntu-latest
 
+    # The MCP servers fetch their JWKS from this issuer, which the e2e test
+    # process serves, so it must be running when tokens are verified.
+    env:
+      OAUTH_ISSUER: http://localhost:9999
+      OAUTH_JWKS_URL: http://localhost:9999/jwks
+
     strategy:
       fail-fast: false
       matrix:
@@ -120,9 +126,17 @@ jobs:
           echo "PAPERLESS_TOKEN=$TOKEN" >> $GITHUB_ENV
           echo "Got token: ${TOKEN:0:8}..."
 
+      # ---- OAuth (own server and issuer, no Paperless needed) ----
+
+      - name: Run OAuth E2E tests
+        run: node --require ts-node/register --test e2e/auth.test.ts 2>&1 | tee /tmp/e2e-auth-output.txt; exit "${PIPESTATUS[0]}"
+
       # ---- CLI MCP mode ----
 
       - name: Start MCP server (CLI mode)
+        if: ${{ !cancelled() }}
+        env:
+          MCP_RESOURCE: http://localhost:3001/mcp
         run: |
           node build/index.js \
             --http --port 3001 \
@@ -130,8 +144,8 @@ jobs:
             --token "$PAPERLESS_TOKEN" &
           echo "MCP_CLI_PID=$!" >> $GITHUB_ENV
           for i in $(seq 1 20); do
-            code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3001/mcp || true)
-            if [ "$code" = "405" ]; then
+            code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3001/.well-known/oauth-protected-resource || true)
+            if [ "$code" = "200" ]; then
               echo "MCP server (CLI) ready"
               exit 0
             fi
@@ -141,11 +155,13 @@ jobs:
           exit 1
 
       - name: Run E2E tests (CLI MCP)
+        if: ${{ !cancelled() }}
         run: node --require ts-node/register --test e2e/e2e.test.ts 2>&1 | tee /tmp/e2e-cli-output.txt; exit "${PIPESTATUS[0]}"
         env:
           PAPERLESS_URL: http://localhost:8000
           PAPERLESS_TOKEN: ${{ env.PAPERLESS_TOKEN }}
           MCP_URL: http://localhost:3001/mcp
+          MCP_RESOURCE: http://localhost:3001/mcp
 
       - name: Stop CLI MCP
         if: always()
@@ -160,10 +176,13 @@ jobs:
             --network host \
             -e PAPERLESS_URL=http://localhost:8000 \
             -e PAPERLESS_API_KEY="$PAPERLESS_TOKEN" \
+            -e OAUTH_ISSUER="$OAUTH_ISSUER" \
+            -e OAUTH_JWKS_URL="$OAUTH_JWKS_URL" \
+            -e MCP_RESOURCE=http://localhost:3000/mcp \
             paperless-mcp:e2e
           for i in $(seq 1 20); do
-            code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/mcp || true)
-            if [ "$code" = "405" ]; then
+            code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/.well-known/oauth-protected-resource || true)
+            if [ "$code" = "200" ]; then
               echo "MCP server (Docker) ready"
               exit 0
             fi
@@ -180,10 +199,13 @@ jobs:
           PAPERLESS_URL: http://localhost:8000
           PAPERLESS_TOKEN: ${{ env.PAPERLESS_TOKEN }}
           MCP_URL: http://localhost:3000/mcp
+          MCP_RESOURCE: http://localhost:3000/mcp
 
       - name: Print logs on failure
         if: failure()
         run: |
+          echo "=== E2E OAuth test output ==="
+          cat /tmp/e2e-auth-output.txt || true
           echo "=== E2E CLI test output ==="
           cat /tmp/e2e-cli-output.txt || true
           echo "=== E2E Docker test output ==="

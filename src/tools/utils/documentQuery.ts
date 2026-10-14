@@ -124,6 +124,13 @@ const DOCUMENT_QUERY_BASE_ARGS_SHAPE = {
   archive_serial_number: z.number().optional(),
   archive_serial_number__isnull: z.boolean().optional(),
   custom_fields__icontains: z.string().min(1).optional(),
+  fields: z
+    .array(z.string())
+    .min(1)
+    .optional()
+    .describe(
+      'Return only these document fields, e.g. ["id","title","correspondent","document_type","tags","created"]. Omit to return every field.'
+    ),
 };
 
 export const LIST_DOCUMENTS_ARGS_SHAPE = {
@@ -170,6 +177,7 @@ export type BuildDocumentQueryArgs = {
   archive_serial_number__isnull?: boolean;
   custom_field_query?: string | CustomFieldQuery;
   custom_fields__icontains?: string;
+  fields?: string[];
   paperless_filters?: Record<string, PaperlessFilterValue>;
 };
 
@@ -189,6 +197,7 @@ const FIRST_CLASS_QUERY_PARAM_MAP = {
   archive_serial_number: "archive_serial_number",
   archive_serial_number__isnull: "archive_serial_number__isnull",
   custom_fields__icontains: "custom_fields__icontains",
+  fields: "fields",
 } as const;
 
 type FirstClassQueryArg = keyof typeof FIRST_CLASS_QUERY_PARAM_MAP;
@@ -312,6 +321,22 @@ const DOCUMENT_QUERY_PAPERLESS_FILTER_KEY_SET: ReadonlySet<string> = new Set(
   DOCUMENT_QUERY_PAPERLESS_FILTER_KEYS
 );
 
+const ID_RANGE_FILTER_KEYS: ReadonlySet<string> = new Set([
+  "id__gt",
+  "id__gte",
+  "id__lt",
+  "id__lte",
+]);
+
+function unsupportedFilterMessage(key: string): string {
+  const message =
+    `Unsupported paperless_filters key '${key}'. Paperless-ngx does not document that filter and silently ignores unknown filters, ` +
+    `which would return all documents. Use documented /api/documents/ query parameter names only.`;
+  return ID_RANGE_FILTER_KEYS.has(key)
+    ? `${message} There is no id range filter: use ordering '-id' with page_size, 'added__date__gt' / 'added__date__gte', or 'id__in'.`
+    : message;
+}
+
 function hasValue<T>(value: T | null | undefined): value is T {
   return value !== undefined && value !== null;
 }
@@ -347,7 +372,7 @@ export function buildDocumentQueryString(args: BuildDocumentQueryArgs): string {
       continue;
     }
 
-    setQueryParam(query, queryParamName, value as string | number | boolean);
+    setQueryParam(query, queryParamName, value);
     firstClassKeys.add(queryParamName);
   }
 
@@ -367,9 +392,7 @@ export function buildDocumentQueryString(args: BuildDocumentQueryArgs): string {
 
   for (const [key, value] of Object.entries(args.paperless_filters)) {
     if (!DOCUMENT_QUERY_PAPERLESS_FILTER_KEY_SET.has(key)) {
-      throw new Error(
-        `Unsupported paperless_filters key '${key}'. Use documented /api/documents/ query parameter names only.`
-      );
+      throw new Error(unsupportedFilterMessage(key));
     }
 
     if (firstClassKeys.has(key)) {

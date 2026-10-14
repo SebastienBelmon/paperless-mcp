@@ -27,8 +27,24 @@ export interface Tag {
   is_insensitive: boolean;
   is_inbox_tag: boolean;
   document_count: number;
+  parent: number | null;
   owner: number | null;
   user_can_change: boolean;
+}
+
+export interface PermissionSubjects {
+  users?: number[];
+  groups?: number[];
+}
+
+export interface SetPermissions {
+  view?: PermissionSubjects;
+  change?: PermissionSubjects;
+}
+
+export interface ObjectWriteFields {
+  owner?: number | null;
+  set_permissions?: SetPermissions;
 }
 
 export interface CustomField {
@@ -196,6 +212,123 @@ export interface MailRule {
 }
 
 export interface GetMailRulesResponse extends PaginationResponse<MailRule> {}
+
+export type TaskStatus =
+  | "PENDING"
+  | "RECEIVED"
+  | "STARTED"
+  | "SUCCESS"
+  | "FAILURE"
+  | "RETRY"
+  | "REVOKED";
+
+export interface PaperlessTask {
+  id: number;
+  task_id: string;
+  task_name: string | null;
+  task_file_name: string | null;
+  date_created: string | null;
+  date_done: string | null;
+  type: string;
+  status: TaskStatus;
+  result: string | null;
+  acknowledged: boolean;
+  related_document: string | null;
+  owner: number | null;
+}
+
+export interface WorkflowTrigger {
+  id?: number | null;
+  type: 1 | 2 | 3 | 4;
+  sources?: Array<1 | 2 | 3 | 4>;
+  filter_path?: string | null;
+  filter_filename?: string | null;
+  filter_mailrule?: number | null;
+  matching_algorithm?: 0 | 1 | 2 | 3 | 4 | 5;
+  match?: string;
+  is_insensitive?: boolean;
+  filter_has_tags?: number[];
+  filter_has_all_tags?: number[];
+  filter_has_not_tags?: number[];
+  filter_has_not_correspondents?: number[];
+  filter_has_not_document_types?: number[];
+  filter_has_not_storage_paths?: number[];
+  filter_custom_field_query?: string | null;
+  filter_has_correspondent?: number | null;
+  filter_has_document_type?: number | null;
+  filter_has_storage_path?: number | null;
+  schedule_offset_days?: number;
+  schedule_is_recurring?: boolean;
+  schedule_recurring_interval_days?: number;
+  schedule_date_field?: "added" | "created" | "modified" | "custom_field";
+  schedule_date_custom_field?: number | null;
+}
+
+export interface WorkflowActionEmail {
+  id?: number | null;
+  subject: string;
+  body: string;
+  to: string;
+  include_document?: boolean;
+}
+
+export interface WorkflowActionWebhook {
+  id?: number | null;
+  url: string;
+  use_params?: boolean;
+  as_json?: boolean;
+  params?: Record<string, unknown> | null;
+  body?: string | null;
+  headers?: Record<string, unknown> | null;
+  include_document?: boolean;
+}
+
+export interface WorkflowAction {
+  id?: number | null;
+  type?: 1 | 2 | 3 | 4;
+  assign_title?: string | null;
+  assign_tags?: number[];
+  assign_correspondent?: number | null;
+  assign_document_type?: number | null;
+  assign_storage_path?: number | null;
+  assign_owner?: number | null;
+  assign_view_users?: number[];
+  assign_view_groups?: number[];
+  assign_change_users?: number[];
+  assign_change_groups?: number[];
+  assign_custom_fields?: number[];
+  assign_custom_fields_values?: Record<string, unknown> | null;
+  remove_all_tags?: boolean;
+  remove_all_correspondents?: boolean;
+  remove_all_document_types?: boolean;
+  remove_all_storage_paths?: boolean;
+  remove_all_custom_fields?: boolean;
+  remove_all_owners?: boolean;
+  remove_all_permissions?: boolean;
+  remove_tags?: number[];
+  remove_correspondents?: number[];
+  remove_document_types?: number[];
+  remove_storage_paths?: number[];
+  remove_custom_fields?: number[];
+  remove_owners?: number[];
+  remove_view_users?: number[];
+  remove_view_groups?: number[];
+  remove_change_users?: number[];
+  remove_change_groups?: number[];
+  email?: WorkflowActionEmail | null;
+  webhook?: WorkflowActionWebhook | null;
+}
+
+export interface Workflow {
+  id: number;
+  name: string;
+  order: number;
+  enabled: boolean;
+  triggers: WorkflowTrigger[];
+  actions: WorkflowAction[];
+}
+
+export interface GetWorkflowsResponse extends PaginationResponse<Workflow> {}
 
 export interface BulkEditDocumentsResult {
   result: string;

@@ -3,11 +3,18 @@ import assert from "node:assert/strict";
 import { spawn, ChildProcess } from "node:child_process";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { connectMcpClient, parseToolText, ToolResult } from "./client";
+import { startTestIssuer, TestIssuer } from "./oauth";
 
 const PAPERLESS_URL = process.env.PAPERLESS_URL ?? "http://localhost:8000";
 const PAPERLESS_TOKEN = process.env.PAPERLESS_TOKEN ?? "";
 const MCP_PORT = process.env.MCP_PORT ?? "3001";
 const MCP_URL = process.env.MCP_URL ?? `http://localhost:${MCP_PORT}/mcp`;
+const MCP_RESOURCE = process.env.MCP_RESOURCE ?? MCP_URL;
+// An already running server (MCP_URL set) fetches its JWKS from OAUTH_ISSUER,
+// so the issuer must listen on that port while the tests run.
+const OAUTH_ISSUER_PORT = process.env.OAUTH_ISSUER
+  ? Number(new URL(process.env.OAUTH_ISSUER).port)
+  : 0;
 
 const RUN_TAG = `e2e-tag-${Date.now()}`;
 const RUN_CORRESPONDENT = `E2E Corp ${Date.now()}`;
@@ -44,6 +51,7 @@ const MINIMAL_PDF = Buffer.concat([
 ]);
 
 let mcpProcess: ChildProcess | undefined;
+let oauthIssuer: TestIssuer | undefined;
 let client: Client;
 
 const state: {
@@ -105,11 +113,11 @@ async function deleteCustomFieldDirect(id: number): Promise<void> {
 }
 
 async function waitForMcp(url: string, maxAttempts = 30): Promise<void> {
-  const base = url.replace(/\/mcp$/, "");
+  const metadataUrl = new URL("/.well-known/oauth-protected-resource", url);
   for (let i = 0; i < maxAttempts; i++) {
     try {
-      const res = await fetch(base + "/mcp", { method: "GET" });
-      if (res.status === 405) return;
+      const res = await fetch(metadataUrl);
+      if (res.status === 200) return;
     } catch {
       // not ready yet
     }
@@ -118,7 +126,7 @@ async function waitForMcp(url: string, maxAttempts = 30): Promise<void> {
   throw new Error("MCP server did not start in time");
 }
 
-function startMcpServer(): ChildProcess {
+function startMcpServer(issuer: TestIssuer): ChildProcess {
   const proc = spawn(
     "node",
     [
@@ -131,7 +139,15 @@ function startMcpServer(): ChildProcess {
       "--token",
       PAPERLESS_TOKEN,
     ],
-    { stdio: ["ignore", "pipe", "pipe"] }
+    {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: {
+        ...process.env,
+        OAUTH_ISSUER: issuer.issuer,
+        OAUTH_JWKS_URL: issuer.jwksUrl,
+        MCP_RESOURCE,
+      },
+    }
   );
   proc.stderr?.on("data", (d) => process.stderr.write(d));
   return proc;
@@ -152,12 +168,14 @@ before(async () => {
   try {
     assert.ok(PAPERLESS_TOKEN, "PAPERLESS_TOKEN env var is required");
 
+    oauthIssuer = await startTestIssuer(OAUTH_ISSUER_PORT);
+
     if (!process.env.MCP_URL) {
-      mcpProcess = startMcpServer();
+      mcpProcess = startMcpServer(oauthIssuer);
       await waitForMcp(MCP_URL);
     }
 
-    client = await connectMcpClient(MCP_URL, PAPERLESS_TOKEN);
+    client = await connectMcpClient(MCP_URL, await oauthIssuer.sign(MCP_RESOURCE));
     console.log("MCP client connected; running scenario...");
   } catch (err) {
     console.error(
@@ -187,6 +205,7 @@ after(async () => {
   }
   await client?.close?.();
   mcpProcess?.kill("SIGTERM");
+  await oauthIssuer?.close();
 });
 
 describe("Paperless MCP E2E scenario", () => {
@@ -807,6 +826,48 @@ describe("Paperless MCP E2E scenario", () => {
     })) as ToolResult;
     assertOk(result, "delete_custom_field");
     state.selectFieldId = undefined;
+  });
+
+  it("get_document_content with offset and max_length returns the requested slice", async () => {
+    assert.ok(state.documentId, "document must be uploaded first");
+    // The fixture PDF has no text and OCR is skipped, so set known content directly.
+    const text = "0123456789abcdefghijklmnopqrstuvwxyz";
+    const patch = await fetch(`${PAPERLESS_URL}/api/documents/${state.documentId}/`, {
+      method: "PATCH",
+      headers: {
+        Authorization: `Token ${PAPERLESS_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ content: text }),
+    });
+    assert.ok(patch.ok, `PATCH content failed: ${patch.status} ${await patch.text()}`);
+
+    const middle = (await client.callTool({
+      name: "get_document_content",
+      arguments: { id: state.documentId, offset: 10, max_length: 5 },
+    })) as ToolResult;
+    assertOk(middle, "get_document_content (middle slice)");
+    assert.deepStrictEqual(parseToolText(middle), {
+      id: state.documentId,
+      title: RUN_DOCUMENT_TITLE,
+      content: "abcde",
+      total_length: text.length,
+      next_offset: 15,
+    });
+
+    const last = (await client.callTool({
+      name: "get_document_content",
+      arguments: { id: state.documentId, offset: 30, max_length: 10 },
+    })) as ToolResult;
+    assertOk(last, "get_document_content (last slice)");
+    const lastData = parseToolText(last) as {
+      content: string;
+      total_length: number;
+      next_offset: number | null;
+    };
+    assert.strictEqual(lastData.content, "uvwxyz");
+    assert.strictEqual(lastData.total_length, text.length);
+    assert.strictEqual(lastData.next_offset, null);
   });
 });
 

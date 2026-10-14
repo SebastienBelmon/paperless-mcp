@@ -185,6 +185,7 @@ When creating or modifying tools, clearly distinguish:
 - `axios` (^1.9.0) - HTTP client for API requests
 - `express` (^5.1.0) - HTTP server for HTTP transport mode
 - `form-data` (^4.0.2) - Multipart form data for file uploads
+- `jose` (^6.2.12) - Validation of OAuth access tokens (JWT) in HTTP mode
 - `typescript` (^5.8.3) - TypeScript compiler (Note: Listed as production dependency in this project)
 - `zod` (~4.4.3) - Schema validation. **The pin is deliberate, do not widen it.** On the v4 path the SDK converts schemas with zod's own `toJSONSchema`, which emits `anyOf` for a nullable or union field; from 4.5.0 on it went back to collapsing unchecked ones into `"type": ["string", "null"]`, which strict MCP clients reject by dropping the whole tool (#138). `src/tools/schemaCompat.test.ts` fails if that form reappears.
 
@@ -402,6 +403,7 @@ export function registerEntityTools(server: McpServer, api: PaperlessAPI) {
 - In HTTP mode, `src/index.ts` starts an Express server and exposes the MCP API at `/mcp`.
 - Each POST to `/mcp` creates a new `McpServer` and `StreamableHTTPServerTransport` for stateless, isolated handling.
 - The port is set with `--port` (default: 3000). Express must be installed for HTTP mode.
+- HTTP mode is an OAuth 2.0 protected resource (`src/auth.ts`): it needs `OAUTH_ISSUER`, `OAUTH_JWKS_URL` and `MCP_RESOURCE`, validates the JWT `Bearer` token of each request, and calls Paperless-NGX with the server's `PAPERLESS_API_KEY`.
 
 ## Related Documentation
 - [Paperless-NGX API Documentation](https://docs.paperless-ngx.com/api/)

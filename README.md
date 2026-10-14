@@ -67,7 +67,8 @@ Add these to your MCP config file:
 | `PAPERLESS_API_KEY` | Yes | — | API token from your Paperless-NGX profile |
 | `PAPERLESS_PUBLIC_URL` | No | `PAPERLESS_URL` | Public-facing URL for document links |
 | `PAPERLESS_API_VERSION` | No | `9` | Paperless-ngx REST API version. `9` works on Paperless-ngx v2.x (recent) and v3.x. Paperless-ngx v3.0.0 dropped support for versions below `9`, so older defaults now return HTTP 406. If you see HTTP 406 errors, set this to a version your server supports. |
-| `PAPERLESS_MCP_UPLOAD_PATHS` | No | — | Colon-separated list of allowed directories for `file_path` uploads. **Recommended for security.** Example: `/var/uploads:/tmp/scans` |
+| `PAPERLESS_MCP_UPLOAD_PATHS` | No | — | List of allowed directories for `file_path` uploads, separated by `:` on Linux/macOS and `;` on Windows. **Recommended for security.** Example: `/var/uploads:/tmp/scans`, or `Z:\Manuels;D:\Scans` on Windows |
+| `PAPERLESS_MCP_MAX_UPLOAD_MB` | No | `100` | Maximum size in MB of a file uploaded with `post_document`. `0` removes the limit. |
 
 That's it! Now you can ask Claude to help you manage your Paperless-NGX documents.
 
@@ -328,7 +329,9 @@ Upload a new document to Paperless-NGX.
 1. **Base64 mode** (traditional): Provide `file` (base64-encoded content) + `filename`
 2. **Filesystem mode** (efficient): Provide `file_path` (absolute path on server)
 
-**Security Note:** When using `file_path`, set the `PAPERLESS_MCP_UPLOAD_PATHS` environment variable (colon-separated list of allowed directories) to restrict uploads to specific locations. Without this, any file on the server's filesystem could be uploaded.
+**Security Note:** When using `file_path`, set the `PAPERLESS_MCP_UPLOAD_PATHS` environment variable (list of allowed directories, separated by `:` on Linux/macOS and `;` on Windows) to restrict uploads to specific locations. Without this, any file on the server's filesystem could be uploaded. Paths are matched after resolving symlinks, and file names are found whether their accents are stored in composed (NFC) or decomposed (NFD) form.
+
+**Large files and redirects:** `file_path` uploads are streamed to Paperless-NGX instead of being loaded in memory, so use them for big files (raise `PAPERLESS_MCP_MAX_UPLOAD_MB` above the default 100). A streamed upload cannot be replayed, so it does not follow HTTP redirects: the configured `PAPERLESS_URL` must be the final URL. A redirect (for example `http://` to `https://`) is reported as an error telling you to fix `PAPERLESS_URL`. A reverse proxy in front of Paperless-NGX may still need a larger body limit (for example nginx `client_max_body_size`).
 
 Parameters:
 - file (optional): Base64 encoded file content. Either `file` or `file_path` required.
@@ -342,8 +345,11 @@ Parameters:
 - tags (optional): Array of tag IDs
 - archive_serial_number (optional): Archive serial number
 - custom_fields (optional): Array of custom field IDs
+- skip_if_duplicate (optional): When `true`, the file's checksum is looked up first and, if a document with the same checksum already exists, `{ duplicate: true, document: { id, title } }` is returned without uploading. Default `false`.
 
-**File size limit:** 100MB for both modes
+**File size limit:** 100MB for both modes by default, configurable with `PAPERLESS_MCP_MAX_UPLOAD_MB` (`0` = unlimited). Base64 mode holds the whole file in memory.
+
+The result is the import task UUID (`status`), not a document id: Paperless-NGX imports asynchronously.
 
 ```typescript
 // Base64 mode (traditional)
@@ -367,6 +373,22 @@ post_document({
   document_type: 2,
   tags: [1, 3]
 })
+```
+
+#### check_duplicates
+Check whether files on the server's filesystem already exist in Paperless-NGX, without uploading anything. Each file is hashed (SHA-256, or MD5 on older instances; detected automatically) and looked up by checksum, which matches the original file of a document. Paths follow the same rules as `post_document`'s `file_path`. Only documents visible to the API token are found, and a file whose checksum equals an existing document's archive (processed) file is not detected, although Paperless-NGX would reject it.
+
+Parameters:
+- file_paths: Array of absolute file paths (at least one)
+
+One unreadable or disallowed file does not fail the batch: its entry carries an `error`.
+
+```typescript
+check_duplicates({ file_paths: ["/var/uploads/invoice.pdf", "/var/uploads/receipt.pdf"] })
+// { results: [
+//   { file_path: "/var/uploads/invoice.pdf", checksum: "…", duplicate: true, document: { id: 12, title: "Invoice" } },
+//   { file_path: "/var/uploads/receipt.pdf", checksum: "…", duplicate: false, document: null }
+// ] }
 ```
 
 ### Document Notes
@@ -819,30 +841,25 @@ npm run start -- <baseUrl> <token> --http --port 3000
 - Each request is handled statelessly, following the [StreamableHTTPServerTransport](https://github.com/modelcontextprotocol/typescript-sdk) pattern.
 - GET and DELETE requests to `/mcp` will return 405 Method Not Allowed.
 
-#### Per-request API token (HTTP/Docker mode)
+#### Authentication (HTTP/Docker mode)
 
-In HTTP mode, clients authenticate by supplying a Paperless-NGX API token via the standard `Authorization` header:
+In HTTP mode the server is an OAuth 2.0 protected resource. Each request to `/mcp`, `/sse` and `/messages` must carry an access token from the configured authorization server:
 
 ```
-Authorization: Bearer <paperless-ngx-api-token>
+Authorization: Bearer <jwt-access-token>
 ```
 
-The token is passed straight through to Paperless-NGX, so each client's own Paperless permissions are enforced end-to-end. This lets a single server instance serve multiple users, each with their own token. The same behaviour applies to both `/mcp` and `/sse` endpoints.
+The token must be an EdDSA-signed JWT of type `at+jwt`, with `OAUTH_ISSUER` as its issuer and `MCP_RESOURCE` in its audience. After validation, the server calls Paperless-NGX with its own `PAPERLESS_API_KEY`; the client token is never sent to Paperless-NGX. A request without a valid token gets `401 Unauthorized` with a `WWW-Authenticate` header that points to the resource metadata ([RFC 9728](https://www.rfc-editor.org/rfc/rfc9728)), served without authentication at `/.well-known/oauth-protected-resource` and `/.well-known/oauth-protected-resource/mcp`.
 
-> **⚠️ Breaking change in v2.0.0 — HTTP mode is now authenticated by default.**
->
-> Previously, a request with no `Authorization` header silently fell back to the server-configured `PAPERLESS_API_KEY`, which left the HTTP endpoint open to anyone who could reach the port. As of v2.0.0, requests without a `Bearer` token are rejected with `401 Unauthorized`. The server token is **never** used for unauthenticated requests unless you explicitly opt in with `--no-auth`.
+HTTP mode does not start unless these variables are set, together with `PAPERLESS_URL` and `PAPERLESS_API_KEY`:
 
-| Scenario | `--no-auth` off (default) | `--no-auth` on |
-|---|---|---|
-| Client sends `Authorization: Bearer <tok>` | `<tok>` (client-supplied) | `<tok>` (client-supplied) |
-| No header, `PAPERLESS_API_KEY` / `--token` set | `401 Unauthorized` | server token |
-| No header, no server token | `401 Unauthorized` | `401 Unauthorized` |
+| Variable | Description |
+|---|---|
+| `OAUTH_ISSUER` | Issuer of the access tokens, e.g. `https://auth.example.com/api/auth` |
+| `OAUTH_JWKS_URL` | JWKS endpoint of the issuer, e.g. `https://auth.example.com/api/auth/jwks` |
+| `MCP_RESOURCE` | Public URL of the MCP endpoint, e.g. `https://paperless-mcp.example.com/mcp`. It must be identical, character for character, to the resource registered with the authorization server and to the URL entered in the MCP client (lowercase, no trailing `/`). |
 
-**Migrating from v1.x:** if you relied on the old fallback (a single shared `PAPERLESS_API_KEY` with clients that don't send a token), you have two options:
-
-1. **Recommended:** have each client send `Authorization: Bearer <paperless-token>`.
-2. **Restore the old behaviour** (trusted/local networks only): start the server with the `--no-auth` flag, e.g. append it to the Docker `command`/args or your CLI invocation. This requires a server token (`PAPERLESS_API_KEY` or `--token`) to be configured.
+> **⚠️ Breaking change:** a Paperless-NGX API token is no longer accepted as the `Bearer` token, and the `--no-auth` flag is removed. Use stdio mode if you do not have an OAuth authorization server.
 
 <details>
 <summary>Docker Deployment</summary>
@@ -862,6 +879,9 @@ services:
       - PAPERLESS_URL=http://your-paperless-ngx-server:8000
       - PAPERLESS_API_KEY=your-paperless-api-key
       - PAPERLESS_PUBLIC_URL=https://paperless-ngx.yourpublicurl.com
+      - OAUTH_ISSUER=https://auth.example.com/api/auth
+      - OAUTH_JWKS_URL=https://auth.example.com/api/auth/jwks
+      - MCP_RESOURCE=https://paperless-mcp.example.com/mcp
     ports:
       - "3000:3000"
     restart: unless-stopped
@@ -890,7 +910,7 @@ mcpServers:
 
 **Notes:**
 - Replace `localhost` with your Docker host's IP address or hostname if running on a remote server
-- The Docker container handles authentication via environment variables, so no credentials are needed in the Continue config
+- The server requires an OAuth access token on each request (see "Authentication (HTTP/Docker mode)")
 - The SSE endpoint is available at `/sse` on the configured port (default: 3000)
 
 </details>
