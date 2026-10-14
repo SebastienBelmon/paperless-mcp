@@ -9,11 +9,12 @@ Dernière mise à jour : 2026-10-14
   `fields`, doublons, tâches, workflows, chemins de fichiers, permissions des tags,
   **mode HTTP protégé par OAuth** et e2e avec émetteur JWT de test.
 - Critères A1–A13 : verts dans GitHub Actions (PR #1, Paperless 2.x et 3.x), et en local.
-- Côté SSO : offshore-auth, branche `MCP-auth`, émet les JWT pour la ressource MCP
-  (vérifié en dev le 2026-10-03). Pas encore commité ni déployé. Il manque le client OAuth pour Claude Code.
+- SSO : PR #12 d'offshore-auth fusionnée et déployée le 2026-10-14 (JWT pour la ressource MCP,
+  redirect `http://localhost` acceptée en prod pour Claude Code, option A). Un seul client `paperless`
+  pour claude.ai et Claude Code (port de retour 31418).
 - GitHub : fork public, lié à baruchiro, aucune PR chez baruchiro. Workflows actifs : `ci.yml`, `e2e.yml`.
   Désactivés : `release.yml`, `docker-publish.yml`, `stale.yml`. `gh` vise le fork par défaut.
-- Coolify : rien de configuré. DNS `paperless-mcp.offshoreservices.fr` créé chez Nordnet.
+- Prod : `https://paperless-mcp.offshoreservices.fr` en ligne (Coolify, `main` du fork). B1 et B2 OK le 2026-10-14.
 
 ## Connu, non corrigé
 
@@ -23,6 +24,5 @@ Dernière mise à jour : 2026-10-14
 
 ## À faire (ordre)
 
-1. offshore-auth : commit et déploiement de `MCP-auth`, clients « Claude (Paperless) » et « Claude Code (Paperless) » (accord demandé).
-2. Coolify : application depuis le `Dockerfile`, branche `main`, variables du SPEC §4 (accord demandé).
-3. Recette B1–B10.
+1. Sébastien suit `.ai/TUTO-CONNEXION.md` : client « Claude (Paperless) », ressource, rôle, claude.ai, Claude Code.
+2. Recette B3–B10 (SPEC §7.B).
