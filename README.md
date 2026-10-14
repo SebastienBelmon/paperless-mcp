@@ -841,30 +841,25 @@ npm run start -- <baseUrl> <token> --http --port 3000
 - Each request is handled statelessly, following the [StreamableHTTPServerTransport](https://github.com/modelcontextprotocol/typescript-sdk) pattern.
 - GET and DELETE requests to `/mcp` will return 405 Method Not Allowed.
 
-#### Per-request API token (HTTP/Docker mode)
+#### Authentication (HTTP/Docker mode)
 
-In HTTP mode, clients authenticate by supplying a Paperless-NGX API token via the standard `Authorization` header:
+In HTTP mode the server is an OAuth 2.0 protected resource. Each request to `/mcp`, `/sse` and `/messages` must carry an access token from the configured authorization server:
 
 ```
-Authorization: Bearer <paperless-ngx-api-token>
+Authorization: Bearer <jwt-access-token>
 ```
 
-The token is passed straight through to Paperless-NGX, so each client's own Paperless permissions are enforced end-to-end. This lets a single server instance serve multiple users, each with their own token. The same behaviour applies to both `/mcp` and `/sse` endpoints.
+The token must be an EdDSA-signed JWT of type `at+jwt`, with `OAUTH_ISSUER` as its issuer and `MCP_RESOURCE` in its audience. After validation, the server calls Paperless-NGX with its own `PAPERLESS_API_KEY`; the client token is never sent to Paperless-NGX. A request without a valid token gets `401 Unauthorized` with a `WWW-Authenticate` header that points to the resource metadata ([RFC 9728](https://www.rfc-editor.org/rfc/rfc9728)), served without authentication at `/.well-known/oauth-protected-resource` and `/.well-known/oauth-protected-resource/mcp`.
 
-> **⚠️ Breaking change in v2.0.0 — HTTP mode is now authenticated by default.**
->
-> Previously, a request with no `Authorization` header silently fell back to the server-configured `PAPERLESS_API_KEY`, which left the HTTP endpoint open to anyone who could reach the port. As of v2.0.0, requests without a `Bearer` token are rejected with `401 Unauthorized`. The server token is **never** used for unauthenticated requests unless you explicitly opt in with `--no-auth`.
+HTTP mode does not start unless these variables are set, together with `PAPERLESS_URL` and `PAPERLESS_API_KEY`:
 
-| Scenario | `--no-auth` off (default) | `--no-auth` on |
-|---|---|---|
-| Client sends `Authorization: Bearer <tok>` | `<tok>` (client-supplied) | `<tok>` (client-supplied) |
-| No header, `PAPERLESS_API_KEY` / `--token` set | `401 Unauthorized` | server token |
-| No header, no server token | `401 Unauthorized` | `401 Unauthorized` |
+| Variable | Description |
+|---|---|
+| `OAUTH_ISSUER` | Issuer of the access tokens, e.g. `https://auth.example.com/api/auth` |
+| `OAUTH_JWKS_URL` | JWKS endpoint of the issuer, e.g. `https://auth.example.com/api/auth/jwks` |
+| `MCP_RESOURCE` | Public URL of the MCP endpoint, e.g. `https://paperless-mcp.example.com/mcp`. It must be identical, character for character, to the resource registered with the authorization server and to the URL entered in the MCP client (lowercase, no trailing `/`). |
 
-**Migrating from v1.x:** if you relied on the old fallback (a single shared `PAPERLESS_API_KEY` with clients that don't send a token), you have two options:
-
-1. **Recommended:** have each client send `Authorization: Bearer <paperless-token>`.
-2. **Restore the old behaviour** (trusted/local networks only): start the server with the `--no-auth` flag, e.g. append it to the Docker `command`/args or your CLI invocation. This requires a server token (`PAPERLESS_API_KEY` or `--token`) to be configured.
+> **⚠️ Breaking change:** a Paperless-NGX API token is no longer accepted as the `Bearer` token, and the `--no-auth` flag is removed. Use stdio mode if you do not have an OAuth authorization server.
 
 <details>
 <summary>Docker Deployment</summary>
@@ -884,6 +879,9 @@ services:
       - PAPERLESS_URL=http://your-paperless-ngx-server:8000
       - PAPERLESS_API_KEY=your-paperless-api-key
       - PAPERLESS_PUBLIC_URL=https://paperless-ngx.yourpublicurl.com
+      - OAUTH_ISSUER=https://auth.example.com/api/auth
+      - OAUTH_JWKS_URL=https://auth.example.com/api/auth/jwks
+      - MCP_RESOURCE=https://paperless-mcp.example.com/mcp
     ports:
       - "3000:3000"
     restart: unless-stopped
@@ -912,7 +910,7 @@ mcpServers:
 
 **Notes:**
 - Replace `localhost` with your Docker host's IP address or hostname if running on a remote server
-- The Docker container handles authentication via environment variables, so no credentials are needed in the Continue config
+- The server requires an OAuth access token on each request (see "Authentication (HTTP/Docker mode)")
 - The SSE endpoint is available at `/sse` on the configured port (default: 3000)
 
 </details>

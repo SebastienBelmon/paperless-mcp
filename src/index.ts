@@ -4,15 +4,12 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import express from "express";
 import { parseArgs } from "node:util";
-import {
-  createMcpServer,
-  getBearerToken,
-  sendUnauthorized,
-} from "./server";
+import { registerOAuth } from "./auth";
+import { createMcpServer } from "./server";
 const { version } = require("../package.json") as { version: string };
 
 const {
-  values: { baseUrl, token, http: useHttp, port, publicUrl, "no-auth": noAuth },
+  values: { baseUrl, token, http: useHttp, port, publicUrl },
 } = parseArgs({
   options: {
     baseUrl: { type: "string" },
@@ -20,7 +17,6 @@ const {
     http: { type: "boolean", default: false },
     port: { type: "string" },
     publicUrl: { type: "string", default: "" },
-    "no-auth": { type: "boolean", default: false },
   },
   allowPositionals: true,
 });
@@ -31,9 +27,9 @@ const resolvedPublicUrl =
   publicUrl || process.env.PAPERLESS_PUBLIC_URL || resolvedBaseUrl;
 const resolvedPort = port ? parseInt(port, 10) : 3000;
 
-if (!resolvedBaseUrl) {
+if (!resolvedBaseUrl || !resolvedToken) {
   console.error(
-    "Usage: paperless-mcp --baseUrl <url> --token <token> [--http] [--port <port>] [--publicUrl <url>] [--no-auth]"
+    "Usage: paperless-mcp --baseUrl <url> --token <token> [--http] [--port <port>] [--publicUrl <url>]"
   );
   console.error(
     "Or set PAPERLESS_URL and PAPERLESS_API_KEY environment variables."
@@ -41,29 +37,23 @@ if (!resolvedBaseUrl) {
   process.exit(1);
 }
 
-if (!useHttp && !resolvedToken) {
+const {
+  OAUTH_ISSUER: oauthIssuer,
+  OAUTH_JWKS_URL: oauthJwksUrl,
+  MCP_RESOURCE: mcpResource,
+} = process.env;
+
+if (useHttp && !(oauthIssuer && oauthJwksUrl && mcpResource)) {
   console.error(
-    "Usage: paperless-mcp --baseUrl <url> --token <token> [--http] [--port <port>] [--publicUrl <url>] [--no-auth]"
-  );
-  console.error(
-    "Or set PAPERLESS_URL and PAPERLESS_API_KEY environment variables."
+    "HTTP mode requires the OAUTH_ISSUER, OAUTH_JWKS_URL and MCP_RESOURCE environment variables."
   );
   process.exit(1);
 }
 
-if (noAuth && !resolvedToken) {
-  console.error(
-    "--no-auth allows unauthenticated requests to use the server's Paperless token, " +
-      "but no server token is configured. Provide --token <token> or set PAPERLESS_API_KEY, " +
-      "or drop --no-auth and have clients authenticate with 'Authorization: Bearer <token>'."
-  );
-  process.exit(1);
-}
-
-function buildServer(requestToken: string) {
+function buildServer() {
   return createMcpServer({
     baseUrl: resolvedBaseUrl!,
-    token: requestToken,
+    token: resolvedToken!,
     version,
     publicUrl: resolvedPublicUrl!,
   });
@@ -71,37 +61,21 @@ function buildServer(requestToken: string) {
 
 async function main() {
   if (useHttp) {
-    if (noAuth) {
-      console.log(
-        "[paperless-mcp] --no-auth is enabled: requests without an 'Authorization: Bearer' header " +
-          "will use the server's Paperless token. Only use this on a trusted/local network."
-      );
-    } else if (resolvedToken) {
-      console.log(
-        "[paperless-mcp] A server token is configured, but unauthenticated requests are rejected. " +
-          "Clients must send 'Authorization: Bearer <paperless-token>'. " +
-          "To use the server token for unauthenticated requests instead, restart with the --no-auth flag " +
-          "(trusted/local networks only)."
-      );
-    }
-
     const app = express();
+    app.set("trust proxy", true);
+    registerOAuth(app, {
+      issuer: oauthIssuer!,
+      jwksUrl: oauthJwksUrl!,
+      resource: mcpResource!,
+    });
     app.use(express.json());
 
     // Store transports for each session
     const sseTransports: Record<string, SSEServerTransport> = {};
 
     app.post("/mcp", async (req, res) => {
-      const requestToken = getBearerToken(req, {
-        fallbackToken: resolvedToken,
-        allowAnonymous: noAuth,
-      });
-      if (!requestToken) {
-        sendUnauthorized(res);
-        return;
-      }
       try {
-        const server = buildServer(requestToken);
+        const server = buildServer();
         const transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: undefined,
         });
@@ -153,16 +127,8 @@ async function main() {
 
     app.get("/sse", async (req, res) => {
       console.log("SSE request received");
-      const requestToken = getBearerToken(req, {
-        fallbackToken: resolvedToken,
-        allowAnonymous: noAuth,
-      });
-      if (!requestToken) {
-        sendUnauthorized(res);
-        return;
-      }
       try {
-        const server = buildServer(requestToken);
+        const server = buildServer();
         const transport = new SSEServerTransport("/messages", res);
         sseTransports[transport.sessionId] = transport;
         res.on("close", () => {
@@ -202,7 +168,7 @@ async function main() {
     });
     // await new Promise((resolve) => setTimeout(resolve, 1000000));
   } else {
-    const server = buildServer(resolvedToken!);
+    const server = buildServer();
     const transport = new StdioServerTransport();
     await server.connect(transport);
   }
